@@ -30,7 +30,12 @@
                 <img src="assets/russignol-logo.svg" alt="Russignol Logo" class="logo" width="40" height="40">
                 <div class="brand-name">Russignol</div>
             </div>
-            <nav class="main-nav">
+            <button class="nav-toggle" type="button" aria-controls="main-nav" aria-expanded="false" aria-label="Open navigation menu">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+            </button>
+            <nav class="main-nav" id="main-nav">
                 <ul>
                     <li><a href="#demo">Demo</a></li>
                     <li><a href="#features">Features</a></li>
@@ -39,6 +44,7 @@
                 </ul>
             </nav>
         </div>
+        <div class="nav-backdrop"></div>
     </header>
 
     <main>
@@ -348,6 +354,40 @@
                     console.error("Failed to copy text: ", err);
                 });
         }
+
+        // Mobile nav toggle
+        const navToggle = document.querySelector('.nav-toggle');
+        const navBackdrop = document.querySelector('.nav-backdrop');
+
+        function toggleMenu() {
+            const isOpen = document.body.classList.toggle('nav-open');
+            navToggle.setAttribute('aria-expanded', isOpen);
+            navToggle.setAttribute('aria-label', isOpen ? 'Close navigation menu' : 'Open navigation menu');
+        }
+
+        navToggle.addEventListener('click', toggleMenu);
+
+        document.querySelectorAll('.main-nav a').forEach(link => {
+            link.addEventListener('click', () => {
+                if (document.body.classList.contains('nav-open')) {
+                    toggleMenu();
+                }
+            });
+        });
+
+        navBackdrop.addEventListener('click', toggleMenu);
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.body.classList.contains('nav-open')) {
+                toggleMenu();
+            }
+        });
+
+        window.matchMedia('(max-width: 768px)').addEventListener('change', (e) => {
+            if (!e.matches && document.body.classList.contains('nav-open')) {
+                toggleMenu();
+            }
+        });
 
         // OS tab switching
         document.querySelectorAll('.os-tab').forEach(tab => {
