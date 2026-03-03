@@ -133,6 +133,9 @@ ul {
     }
 }
 .hero {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
     padding: 80px 0;
     background-color: var(--bg-color);
     /* border-bottom: 1px solid var(--border-color); */
@@ -257,12 +260,67 @@ ul {
     background-color: var(--primary-color);
     color: black;
 }
+.demo {
+    padding: 120px 0;
+    background-color: var(--bg-color);
+    position: relative;
+}
+.demo-description {
+    text-align: center;
+    color: var(--accent-color);
+    max-width: 700px;
+    margin: 0 auto 2.5rem;
+    font-size: 1.15rem;
+}
+.demo-video-wrapper {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 24px;
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    position: relative;
+}
+.demo-video-wrapper::before {
+    content: '';
+    position: absolute;
+    top: -4px;
+    left: -4px;
+    width: 20px;
+    height: 20px;
+    border-top: 2px solid var(--primary-color);
+    border-left: 2px solid var(--primary-color);
+}
+.demo-video-wrapper::after {
+    content: '';
+    position: absolute;
+    bottom: -4px;
+    right: -4px;
+    width: 20px;
+    height: 20px;
+    border-bottom: 2px solid var(--primary-color);
+    border-right: 2px solid var(--primary-color);
+}
+.demo-video {
+    position: relative;
+    padding-bottom: 56.25%;
+    height: 0;
+    overflow: hidden;
+}
+.demo-video iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+}
 .features {
-    padding: 80px 0;
+    padding: 120px 0;
     background-color: var(--bg-color);
     /* border-bottom: 1px solid var(--border-color); */
     position: relative;
 }
+.demo h2,
 .features h2,
 .downloads h2,
 .setup h2 {
@@ -395,7 +453,7 @@ ul {
     color: white;
 }
 .setup {
-    padding: 80px 0;
+    padding: 120px 0;
     background-color: var(--bg-color);
     position: relative;
 }
@@ -711,10 +769,17 @@ footer a:hover {
     .code-block-container {
         width: 100%;
     }
+    .demo-video-wrapper {
+        padding: 16px;
+    }
+    .demo-description {
+        font-size: 1rem;
+    }
 }
 /* Modern Gradient Separators */
 .main-header::after,
 .hero::after,
+.demo::after,
 .features::after,
 .setup::after {
     content: '';
