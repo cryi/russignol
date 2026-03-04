@@ -1,7 +1,7 @@
 use embedded_graphics::prelude::Point;
 use russignol_signer_lib::ChainId;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     // === First-boot setup events ===
     StartSetup,                 // User tapped "Begin" to start first-boot setup
