@@ -85,6 +85,9 @@ fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Resu
     // Clean if requested
     if force_clean {
         println!("Cleaning buildroot...");
+        // Remove .config before make clean — Buildroot 2026.02+ checks for legacy
+        // config options before any target, including clean, causing a spurious failure.
+        let _ = std::fs::remove_file(".config");
         run_cmd_in_dir(".", "make", &["clean"], "Clean failed")?;
         println!("  {} Clean complete", "✓".green());
         println!();

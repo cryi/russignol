@@ -41,12 +41,28 @@ pub fn get_busybox_config(is_dev: bool) -> &'static str {
     }
 }
 
-/// Run make in buildroot directory with `BR2_EXTERNAL` set
+/// Run make in buildroot directory with `BR2_EXTERNAL` set.
+///
+/// When the `rpi-linux` git submodule exists alongside the buildroot directory,
+/// passes `LINUX_OVERRIDE_SRCDIR` so Buildroot rsyncs the kernel source locally
+/// instead of downloading the tarball. This is significantly faster for clean builds.
 pub fn run_buildroot_make(buildroot_dir: &Path, external_tree: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("make")
-        .current_dir(buildroot_dir)
-        .env("BR2_EXTERNAL", external_tree)
-        .args(args)
+    let mut cmd = Command::new("make");
+    cmd.current_dir(buildroot_dir)
+        .env("BR2_EXTERNAL", external_tree);
+
+    // Use local kernel source when the rpi-linux submodule is populated
+    let rpi_linux_dir = buildroot_dir.join("../rpi-linux");
+    if rpi_linux_dir.join("Makefile").exists() {
+        let abs_path = rpi_linux_dir
+            .canonicalize()
+            .context("Failed to resolve rpi-linux path")?;
+        cmd.arg(format!("LINUX_OVERRIDE_SRCDIR={}", abs_path.display()));
+    }
+
+    cmd.args(args);
+
+    let status = cmd
         .status()
         .with_context(|| format!("Failed to execute: make {}", args.join(" ")))?;
 
