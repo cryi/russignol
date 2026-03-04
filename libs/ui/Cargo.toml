@@ -10,10 +10,7 @@ license = "MIT"
 workspace = true
 
 [dependencies]
-embedded-graphics = "0.8.1"
-embedded-hal = "1.0.0"
-linux-embedded-hal = "0.4"
-epd-2in13-v4 = { path = "../epd-2in13-v4" }
+embedded-graphics = "0.8.2"
 tinybmp = "0.7.0"
 u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
 embedded-layout = "0.4.2"

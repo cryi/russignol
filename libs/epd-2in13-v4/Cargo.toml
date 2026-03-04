@@ -16,11 +16,11 @@ doctest = false
 [dependencies]
 embedded-hal = "1.0.0"
 linux-embedded-hal = "0.4.1"
-embedded-graphics = "0.8.1"
+embedded-graphics = "0.8.2"
 log = "0.4.29"
 crossbeam-channel = "0.5.15"
 thiserror = "2.0"
 
 [dev-dependencies]
-chrono = "0.4.43"
-env_logger = "0.11.8"
+chrono = "0.4.44"
+env_logger = "0.11.9"

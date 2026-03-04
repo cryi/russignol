@@ -17,15 +17,11 @@ path = "src/main.rs"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
-embedded-graphics = "0.8.1"
-embedded-hal = "1.0.0"
+embedded-graphics = "0.8.2"
 crossbeam-channel = "0.5"
-linux-embedded-hal = "0.4"
 epd-2in13-v4 = { path = "../libs/epd-2in13-v4", version = "0.1.0" }
 russignol-signer-lib = { path = "../libs/signer", version = "0.6.4" }
 russignol-ui = { path = "../libs/ui" }
-chrono = "0.4"
-rand = "0.9.2"
 # Encryption for PIN-protected key storage
 russignol-crypto = { path = "../libs/crypto" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -36,9 +32,6 @@ embedded-text = "0.7.3"
 u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
 ctrlc = "3.5"
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
-
-[dev-dependencies]
-tempfile = "3"
 
 # Note: [profile.release] settings moved to workspace Cargo.toml
 # All optimization settings are now applied workspace-wide

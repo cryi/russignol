@@ -14,26 +14,24 @@ name = "russignol"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.101"
-chrono = "0.4.43"
-clap = { version = "4.5.57", features = ["derive"] }
+anyhow = "1.0.102"
+chrono = "0.4.44"
+clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4"
 colored = "3.1.1"
 dirs = "6.0"
-env_logger = "0.11.8"
-indicatif = "0.18.3"
+env_logger = "0.11.9"
+indicatif = "0.18.4"
 inquire = "0.9"
 log = "0.4.29"
-nix = { version = "0.31.1", features = ["user", "process"] }
-regex = "1.12.3"
+nix = { version = "0.31.2", features = ["user", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 shellexpand = "3.1"
-thiserror = "2.0.18"
 ureq = "3.2"
 semver = "1.0"
 sha2 = "0.10"
-tempfile = "3.24"
+tempfile = "3.26"
 lzma-rs = "0.3"
 unicode-width = "0.2"
 zeroize = { version = "1.8.2", features = ["derive"] }
