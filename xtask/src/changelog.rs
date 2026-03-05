@@ -408,8 +408,11 @@ pub fn get_bump_type_for_component(
 }
 
 /// Parse a semantic version string into (major, minor, patch)
+///
+/// Strips any pre-release suffix before parsing (e.g., "1.2.3-beta.1" → (1, 2, 3)).
 pub fn parse_version(version: &str) -> Result<(u32, u32, u32)> {
-    let parts: Vec<&str> = version.split('.').collect();
+    let base = base_version(version);
+    let parts: Vec<&str> = base.split('.').collect();
     if parts.len() != 3 {
         bail!("Invalid version format: {version}. Expected MAJOR.MINOR.PATCH");
     }
@@ -438,6 +441,52 @@ pub fn bump_version(version: &str, bump_type: BumpType) -> Result<String> {
     };
 
     Ok(format!("{new_major}.{new_minor}.{new_patch}"))
+}
+
+/// Extract the base version (without pre-release suffix) from a version string
+///
+/// "1.2.3" → "1.2.3", "1.2.3-beta.1" → "1.2.3"
+pub fn base_version(version: &str) -> &str {
+    version.split_once('-').map_or(version, |(base, _)| base)
+}
+
+/// Extract the pre-release suffix from a version string
+///
+/// "1.2.3" → None, "1.2.3-beta.1" → Some("beta.1")
+pub fn pre_release(version: &str) -> Option<&str> {
+    version.split_once('-').map(|(_, suffix)| suffix)
+}
+
+/// Find the next beta number for a given base version by scanning git tags
+///
+/// Searches for tags matching `v{base}-beta.*` (or `{prefix}-v{base}-beta.*`)
+/// and returns max+1 (or 1 if none exist).
+pub fn next_beta_number(tag_prefix: Option<&str>, base_ver: &str) -> Result<u32> {
+    let pattern = if let Some(prefix) = tag_prefix {
+        format!("{prefix}-v{base_ver}-beta.*")
+    } else {
+        format!("v{base_ver}-beta.*")
+    };
+
+    let output = Command::new("git")
+        .args(["tag", "-l", &pattern])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git tag")?;
+
+    if !output.status.success() {
+        bail!("git tag -l failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let max_beta = stdout
+        .lines()
+        .filter_map(|tag| tag.rsplit_once("-beta."))
+        .filter_map(|(_, n)| n.parse::<u32>().ok())
+        .max();
+
+    Ok(max_beta.map_or(1, |n| n + 1))
 }
 
 /// Generate changelog markdown from parsed commits
@@ -505,11 +554,6 @@ fn format_commit(commit: &ParsedCommit) -> String {
     } else {
         format!("- {} ({})\n", commit.description, commit.hash)
     }
-}
-
-/// Create changelog file for a release (full release, all commits)
-pub fn create_changelog_file(version: &str) -> Result<String> {
-    create_changelog_file_for_component(version, None, None)
 }
 
 /// Create changelog file for a component release
@@ -586,6 +630,26 @@ pub fn create_changelog_file_for_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_base_version_stable() {
+        assert_eq!(base_version("1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn test_base_version_beta() {
+        assert_eq!(base_version("1.2.3-beta.1"), "1.2.3");
+    }
+
+    #[test]
+    fn test_pre_release_none() {
+        assert_eq!(pre_release("1.2.3"), None);
+    }
+
+    #[test]
+    fn test_pre_release_beta() {
+        assert_eq!(pre_release("1.2.3-beta.1"), Some("beta.1"));
+    }
 
     #[test]
     fn test_parse_commit_with_scope() {

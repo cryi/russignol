@@ -41,6 +41,15 @@ enum Arch {
     All,
 }
 
+/// Release channel
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReleaseChannel {
+    /// Beta pre-release (e.g., 0.20.0-beta.1)
+    Beta,
+    /// Stable release (e.g., 0.20.0)
+    Stable,
+}
+
 /// Component to release in monorepo-style releases
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ReleaseComponent {
@@ -63,6 +72,7 @@ enum ReleaseComponent {
 /// Options for the release command
 #[allow(clippy::struct_excessive_bools)]
 struct ReleaseOptions {
+    channel: ReleaseChannel,
     component: ReleaseComponent,
     no_bump: bool,
     clean: bool,
@@ -83,16 +93,24 @@ impl ReleaseComponent {
         }
     }
 
-    /// Get the tag prefix for this component
-    fn tag_prefix(self) -> &'static str {
+    /// Get the tag prefix for this component (None for full releases)
+    fn tag_prefix(self) -> Option<&'static str> {
         match self {
-            Self::Signer => "signer",
-            Self::HostUtility => "host-utility",
-            Self::SignerLib => "signer-lib",
-            Self::Ui => "ui",
-            Self::Crypto => "crypto",
-            Self::EpdDisplay => "epd-display",
-            Self::All => "", // No prefix for full releases (uses "v{version}")
+            Self::Signer => Some("signer"),
+            Self::HostUtility => Some("host-utility"),
+            Self::SignerLib => Some("signer-lib"),
+            Self::Ui => Some("ui"),
+            Self::Crypto => Some("crypto"),
+            Self::EpdDisplay => Some("epd-display"),
+            Self::All => None,
+        }
+    }
+
+    /// Format a git tag for this component and version
+    fn format_tag(self, version: &str) -> String {
+        match self.tag_prefix() {
+            Some(prefix) => format!("{prefix}-v{version}"),
+            None => format!("v{version}"),
         }
     }
 
@@ -166,6 +184,9 @@ enum Commands {
 
     /// Full release: test, build (rpi-signer + host-utility + image), optionally publish to GitHub - always hardened
     Release {
+        /// Release channel: beta or stable
+        channel: ReleaseChannel,
+
         /// Component to release (default: all for full release)
         #[arg(short, long, default_value = "all")]
         component: ReleaseComponent,
@@ -358,12 +379,14 @@ fn try_main() -> Result<()> {
             },
         },
         Commands::Release {
+            channel,
             component,
             no_bump,
             clean,
             github,
             website,
         } => cmd_release(&ReleaseOptions {
+            channel,
             component,
             no_bump,
             clean,
@@ -687,14 +710,10 @@ fn cmd_website_publish() -> Result<()> {
 fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
     let version = get_component_version(component)?;
 
-    let (tag, title) = if component == ReleaseComponent::All {
-        (format!("v{version}"), format!("Russignol v{version}"))
-    } else {
-        let prefix = component.tag_prefix();
-        (
-            format!("{prefix}-v{version}"),
-            format!("Russignol {} v{version}", component.display_name()),
-        )
+    let tag = component.format_tag(&version);
+    let title = match component {
+        ReleaseComponent::All => format!("Russignol v{version}"),
+        _ => format!("Russignol {} v{version}", component.display_name()),
     };
 
     println!(
@@ -715,13 +734,11 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
 
     // Generate changelog from conventional commits
     println!("  Generating changelog...");
-    let changelog_path = if component == ReleaseComponent::All {
-        changelog::create_changelog_file(&version)?
-    } else {
-        let prefix = component.tag_prefix();
-        let scope = component.commit_scope();
-        changelog::create_changelog_file_for_component(&version, Some(prefix), scope)?
-    };
+    let changelog_path = changelog::create_changelog_file_for_component(
+        &version,
+        component.tag_prefix(),
+        component.commit_scope(),
+    )?;
 
     // Create GitHub release with assets
     println!("  Creating release on GitHub...");
@@ -735,6 +752,10 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
         "--notes-file",
         &changelog_path,
     ];
+
+    if changelog::pre_release(&version).is_some() {
+        args.push("--prerelease");
+    }
 
     for asset in &assets {
         args.push(asset);
@@ -782,12 +803,17 @@ fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
 
 fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     let ReleaseOptions {
+        channel,
         component,
         no_bump,
         clean,
         github,
         website,
     } = *opts;
+
+    if channel == ReleaseChannel::Beta && no_bump {
+        bail!("Cannot use --no-bump with beta channel");
+    }
 
     let mut step = 1;
 
@@ -796,7 +822,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
         get_component_version(component)?
     } else {
         println!("\n{}", format!("Step {step}: Bump Version").cyan().bold());
-        let new_version = bump_component_version(component)?;
+        let new_version = bump_component_version(component, channel)?;
         step += 1;
         new_version
     };
@@ -863,27 +889,59 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     Ok(())
 }
 
-/// Bump the version for a component based on conventional commits
-fn bump_component_version(component: ReleaseComponent) -> Result<String> {
-    let prefix = if component == ReleaseComponent::All {
-        None
-    } else {
-        Some(component.tag_prefix())
-    };
-    let scope = component.commit_scope();
-
-    // Determine bump type from commits
+/// Analyze commits since last tag and bump the version accordingly
+fn analyze_and_bump(
+    prefix: Option<&str>,
+    scope: Option<&str>,
+    current_version: &str,
+) -> Result<String> {
     let bump_type = changelog::get_bump_type_for_component(prefix, scope)?;
     println!("  Detected {bump_type} bump from commits");
+    changelog::bump_version(current_version, bump_type)
+}
 
-    // Get current version and calculate new version
+/// Bump the version for a component based on conventional commits and release channel
+fn bump_component_version(component: ReleaseComponent, channel: ReleaseChannel) -> Result<String> {
+    let prefix = component.tag_prefix();
+    let scope = component.commit_scope();
     let current_version = get_component_version(component)?;
-    let new_version = changelog::bump_version(&current_version, bump_type)?;
+    let is_pre_release = changelog::pre_release(&current_version).is_some();
+
+    let new_version = match (channel, is_pre_release) {
+        // Beta + current is pre-release: increment beta number, skip commit analysis
+        (ReleaseChannel::Beta, true) => {
+            changelog::fetch_remote_tags()?;
+            if changelog::head_is_tagged()? {
+                bail!("HEAD is already tagged. Nothing to bump.");
+            }
+            let base = changelog::base_version(&current_version);
+            let beta_n = changelog::next_beta_number(prefix, base)?;
+            format!("{base}-beta.{beta_n}")
+        }
+        // Beta + current is stable: analyze commits, bump, append -beta.N
+        (ReleaseChannel::Beta, false) => {
+            let bumped = analyze_and_bump(prefix, scope, &current_version)?;
+            let beta_n = changelog::next_beta_number(prefix, &bumped)?;
+            format!("{bumped}-beta.{beta_n}")
+        }
+        // Stable + current is pre-release: graduate (strip suffix), skip commit analysis
+        (ReleaseChannel::Stable, true) => {
+            changelog::fetch_remote_tags()?;
+            let base = changelog::base_version(&current_version);
+            let stable_tag = component.format_tag(base);
+            if changelog::tag_exists(&stable_tag)? {
+                bail!("Stable tag {stable_tag} already exists. Nothing to bump.");
+            }
+            base.to_string()
+        }
+        // Stable + current is stable: unchanged (current behavior)
+        (ReleaseChannel::Stable, false) => analyze_and_bump(prefix, scope, &current_version)?,
+    };
+
     println!("  {} → {}", current_version, new_version.green());
 
     // Update Cargo.toml(s)
     if component == ReleaseComponent::All {
-        // Full release: update both signer and host-utility versions
         update_cargo_version("rpi-signer/Cargo.toml", &new_version)?;
         update_cargo_version("host-utility/Cargo.toml", &new_version)?;
     } else {
@@ -980,12 +1038,8 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
     }
 
     // Create commit message
-    let (scope, tag) = if component == ReleaseComponent::All {
-        ("release".to_string(), format!("v{version}"))
-    } else {
-        let prefix = component.tag_prefix();
-        (prefix.to_string(), format!("{prefix}-v{version}"))
-    };
+    let tag = component.format_tag(version);
+    let scope = component.tag_prefix().unwrap_or("release").to_string();
 
     let commit_msg = format!("chore({scope}): release {tag}");
 
@@ -1265,11 +1319,7 @@ fn print_release_summary(component: ReleaseComponent, version: &str, github: boo
     }
 
     if github {
-        let tag = if component == ReleaseComponent::All {
-            format!("v{version}")
-        } else {
-            format!("{}-v{version}", component.tag_prefix())
-        };
+        let tag = component.format_tag(version);
         println!("  - GitHub: https://github.com/RichAyotte/russignol/releases/tag/{tag}");
     }
 
