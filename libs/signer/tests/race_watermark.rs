@@ -444,11 +444,12 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     }
 }
 
-/// Test: .prev backup file is durable after write_watermark
+/// Test: .prev backup file is written after write_watermark
 ///
-/// Verifies that the .prev file is fsynced (has valid data) after write_watermark.
+/// Verifies that the .prev file has valid data after write_watermark.
+/// Note: .prev is best-effort (no fsync) — it reaches disk via OS writeback.
 #[test]
-fn test_prev_file_is_durable() {
+fn test_prev_file_is_written() {
     let temp_dir = TempDir::new().unwrap();
     let chain_id = test_chain_id();
     let seed = [42u8; 32];

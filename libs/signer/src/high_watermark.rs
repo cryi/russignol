@@ -5,8 +5,8 @@
 //! constitute double-signing (slashable offense in Tenderbake consensus).
 //!
 //! Watermarks are stored as 40-byte binary files (level + round + Blake3)
-//! and fsynced to disk before any signature is returned. Each operation
-//! type has a `.prev` backup for crash recovery.
+//! and fdatasynced to disk before any signature is returned. Each operation
+//! type has a best-effort `.prev` backup for crash recovery.
 //!
 //! Corresponds to: src/bin_signer/handler.ml:27-232
 
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Size of a watermark file: level (4) + round (4) + blake3 (32)
 const WATERMARK_FILE_SIZE: usize = 40;
@@ -177,16 +177,16 @@ pub type Result<T> = std::result::Result<T, WatermarkError>;
 /// Prevents double-signing by tracking the highest level/round signed
 /// for each operation type (block, preattestation, attestation).
 ///
-/// Watermarks are stored as 40-byte binary files and fsynced before
-/// any signature is returned. File handles are opened at construction
-/// so no path lookups occur at signing time.
+/// Watermarks are stored as 40-byte binary files and fdatasynced before
+/// any signature is returned. All file handles (primary and `.prev` backup)
+/// are opened at construction so no path lookups occur at signing time.
 ///
 /// Corresponds to: src/bin_signer/handler.ml:27-232
 pub struct HighWatermark {
-    /// Storage directory
-    base_dir: PathBuf,
     /// Primary file handles, indexed by `OperationType as usize`
     files: [File; 3],
+    /// Backup (.prev) file handles, indexed by `OperationType as usize`
+    prev_files: [File; 3],
     /// In-memory cache, indexed by `OperationType as usize`
     entries: [Option<WatermarkEntry>; 3],
 }
@@ -197,10 +197,11 @@ impl HighWatermark {
     /// Opens (or creates) the three watermark files and loads their entries.
     /// Falls back to `.prev` if a primary file has a bad hash.
     pub fn new<P: AsRef<Path>>(base_dir: P) -> io::Result<Self> {
-        let base_dir = base_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&base_dir)?;
+        let base_dir = base_dir.as_ref();
+        fs::create_dir_all(base_dir)?;
 
         let mut files_opt: [Option<File>; 3] = [None, None, None];
+        let mut prev_files_opt: [Option<File>; 3] = [None, None, None];
         let mut entries: [Option<WatermarkEntry>; 3] = [None, None, None];
 
         for (i, filename) in FILENAMES.iter().enumerate() {
@@ -212,10 +213,17 @@ impl HighWatermark {
                 .truncate(false)
                 .open(&path)?;
 
+            let prev_path = base_dir.join(format!("{filename}.prev"));
+            let prev_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&prev_path)?;
+
             // Try primary, then fall back to .prev
             entries[i] = load_entry_from_file(&file).or_else(|| {
-                let prev_path = base_dir.join(format!("{filename}.prev"));
-                let entry = load_entry_from_path(&prev_path);
+                let entry = load_entry_from_file(&prev_file);
                 if entry.is_some() {
                     log::warn!("Primary watermark {filename} corrupt/missing, loaded from .prev");
                 }
@@ -223,14 +231,19 @@ impl HighWatermark {
             });
 
             files_opt[i] = Some(file);
+            prev_files_opt[i] = Some(prev_file);
         }
 
         Ok(Self {
-            base_dir,
             files: [
                 files_opt[0].take().unwrap(),
                 files_opt[1].take().unwrap(),
                 files_opt[2].take().unwrap(),
+            ],
+            prev_files: [
+                prev_files_opt[0].take().unwrap(),
+                prev_files_opt[1].take().unwrap(),
+                prev_files_opt[2].take().unwrap(),
             ],
             entries,
         })
@@ -321,33 +334,29 @@ impl HighWatermark {
             let file = &self.files[update.idx];
             let buf = encode_entry(prev.level, prev.round);
             file.write_all_at(&buf, 0)?;
-            file.set_len(WATERMARK_FILE_SIZE as u64)?;
-            file.sync_all()?;
+            file.sync_data()?;
         }
         Ok(())
     }
 
-    /// Persist watermark to disk: copy main → .prev, pwrite, fsync.
+    /// Persist watermark to disk: best-effort copy main → .prev, pwrite, fdatasync.
     ///
     /// Uses `pwrite` (no seek) and takes `&self`, so it can run in parallel
     /// with BLS signing on a scoped thread while the caller holds a write lock.
+    ///
+    /// The `.prev` backup is best-effort (no fsync) — it reaches disk via normal
+    /// OS writeback and may contain stale data after power loss, which is acceptable
+    /// since the main file is always fsynced.
     pub fn write_watermark(&self, update: &WatermarkUpdate) -> Result<()> {
         let file = &self.files[update.idx];
-        let filename = FILENAMES[update.idx];
 
-        // Copy current main → .prev with fsync for durable backup
-        let main_path = self.base_dir.join(filename);
-        let prev_path = self.base_dir.join(format!("{filename}.prev"));
-        if let Ok(data) = fs::read(&main_path)
-            && let Ok(prev_file) = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&prev_path)
-            && prev_file.write_all_at(&data, 0).is_ok()
-            && let Err(e) = prev_file.sync_all()
-        {
-            log::warn!("Failed to fsync {filename}.prev: {e}");
+        // Best-effort copy current main → .prev (no fsync, reaches disk via OS writeback)
+        let mut current = [0u8; WATERMARK_FILE_SIZE];
+        if file.read_exact_at(&mut current, 0).is_ok() {
+            let filename = FILENAMES[update.idx];
+            if let Err(e) = self.prev_files[update.idx].write_all_at(&current, 0) {
+                log::warn!("Failed to write {filename}.prev: {e}");
+            }
         }
 
         // Build 40-byte buffer: level (4B BE) + round (4B BE) + blake3 (32B)
@@ -356,24 +365,26 @@ impl HighWatermark {
         // pwrite at offset 0 (no seek, no position change)
         file.write_all_at(&buf, 0)?;
 
-        // Truncate to exact size in case file was previously larger
-        file.set_len(WATERMARK_FILE_SIZE as u64)?;
+        // fdatasync — flushes data to stable storage (skips metadata since size is constant)
+        file.sync_data()?;
 
-        // fsync — flushes inode + data to stable storage
-        file.sync_all()?;
-
-        // Read-back verification: confirm the fsynced data decodes correctly
-        let readback = load_entry_from_file(file).ok_or_else(|| {
-            WatermarkError::Internal(format!(
-                "Read-back verification failed for {filename}: data on disk does not match expected watermark (level={}, round={})",
-                update.level, update.round
-            ))
-        })?;
-        if readback.level != update.level || readback.round != update.round {
-            return Err(WatermarkError::Internal(format!(
-                "Read-back mismatch for {filename}: expected level={}/round={}, got level={}/round={}",
-                update.level, update.round, readback.level, readback.round
-            )));
+        // Read-back verification in debug/test builds only — after fdatasync, data is
+        // guaranteed on stable storage; this is defense-in-depth.
+        #[cfg(debug_assertions)]
+        {
+            let filename = FILENAMES[update.idx];
+            let readback = load_entry_from_file(file).ok_or_else(|| {
+                WatermarkError::Internal(format!(
+                    "Read-back verification failed for {filename}: data on disk does not match expected watermark (level={}, round={})",
+                    update.level, update.round
+                ))
+            })?;
+            if readback.level != update.level || readback.round != update.round {
+                return Err(WatermarkError::Internal(format!(
+                    "Read-back mismatch for {filename}: expected level={}/round={}, got level={}/round={}",
+                    update.level, update.round, readback.level, readback.round
+                )));
+            }
         }
 
         Ok(())
@@ -464,6 +475,7 @@ fn load_entry_from_file(file: &File) -> Option<WatermarkEntry> {
 }
 
 /// Load a watermark entry from a file path.
+#[cfg(test)]
 fn load_entry_from_path(path: &Path) -> Option<WatermarkEntry> {
     let data = fs::read(path).ok()?;
     if data.len() != WATERMARK_FILE_SIZE {
