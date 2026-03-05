@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Setup high watermark
     let temp_dir = TempDir::new()?;
-    let watermark = HighWatermark::new(temp_dir.path())?;
+    let watermark = HighWatermark::new(temp_dir.path(), &[pkh1, pkh2])?;
     println!("📊 High watermark protection enabled");
     println!("  Storage: {}\n", temp_dir.path().display());
 

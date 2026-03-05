@@ -18,17 +18,17 @@ fn chain_id_from_index(n: u32) -> ChainId {
 #[test]
 fn test_large_watermark_file_rejected() {
     let temp_dir = TempDir::new().unwrap();
-
-    // Create an oversized watermark file (not 40 bytes)
-    let watermark_file = temp_dir.path().join("block_watermark");
-    let large_content = "x".repeat(70 * 1024); // 70KB
-    std::fs::write(&watermark_file, large_content).unwrap();
-
-    // HighWatermark should handle large file gracefully (entry will be None)
-    let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
-
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+    // Create per-key dir with an oversized watermark file (not 40 bytes)
+    let key_dir = temp_dir.path().join(pkh.to_b58check());
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let large_content = "x".repeat(70 * 1024); // 70KB
+    std::fs::write(key_dir.join("block_watermark"), large_content).unwrap();
+
+    // HighWatermark should handle large file gracefully (entry will be None)
+    let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
     let chain_id = chain_id_from_index(1);
     let data = create_block_data(100, 0);
@@ -45,19 +45,20 @@ fn test_large_watermark_file_rejected() {
 #[test]
 fn test_corrupt_watermark_file_rejected() {
     let temp_dir = TempDir::new().unwrap();
+    let seed = [42u8; 32];
+    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    // Write 40 bytes with bad Blake3 hash
-    let watermark_file = temp_dir.path().join("block_watermark");
+    // Create per-key dir with 40 bytes containing a bad Blake3 hash
+    let key_dir = temp_dir.path().join(pkh.to_b58check());
+    std::fs::create_dir_all(&key_dir).unwrap();
     let mut buf = [0u8; 40];
     buf[0..4].copy_from_slice(&100u32.to_be_bytes()); // level
     buf[4..8].copy_from_slice(&5u32.to_be_bytes()); // round
     buf[8..40].fill(0xFF); // bad hash
-    std::fs::write(&watermark_file, &buf).unwrap();
+    std::fs::write(key_dir.join("block_watermark"), &buf).unwrap();
 
-    let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+    let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
-    let seed = [42u8; 32];
-    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
     let chain_id = chain_id_from_index(1);
     let data = create_block_data(100, 0);
     let result = hwm.check_and_update(chain_id, &pkh, &data);
@@ -77,8 +78,8 @@ fn test_valid_watermark_accepted() {
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
     let chain_id = chain_id_from_index(1);
 
-    preinit_watermarks(temp_dir.path(), 99);
-    let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
+    let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
     let data = create_block_data(100, 0);
     let result = hwm.check_and_update(chain_id, &pkh, &data);

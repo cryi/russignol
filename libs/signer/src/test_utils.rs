@@ -4,6 +4,7 @@
 //! watermark protection and signing operations. The formats follow the
 //! Tenderbake consensus protocol specifications.
 
+use crate::bls::PublicKeyHash;
 use crate::high_watermark::{ChainId, encode_entry};
 use crate::protocol::encoding::{decode_response, encode_request};
 use crate::protocol::{SignerRequest, SignerResponse};
@@ -145,14 +146,19 @@ pub fn ghostnet_chain_id() -> ChainId {
 /// Pre-initialize watermark files for testing
 ///
 /// Creates 40-byte binary watermark files for all three operation types
-/// (block, attestation, preattestation). This is required because the watermark system
-/// enforces mandatory initialization - signing attempts without pre-initialized
-/// watermarks are rejected.
+/// (block, attestation, preattestation) in the per-key subdirectory.
+/// This is required because the watermark system enforces mandatory
+/// initialization - signing attempts without pre-initialized watermarks
+/// are rejected.
 ///
 /// # Arguments
-/// * `base_dir` - Directory where watermark files will be created
+/// * `base_dir` - Base watermark directory
+/// * `pkh` - Public key hash (determines the per-key subdirectory)
 /// * `level` - The initial watermark level (signing will only succeed above this level)
-pub fn preinit_watermarks(base_dir: &Path, level: u32) {
+pub fn preinit_watermarks(base_dir: &Path, pkh: &PublicKeyHash, level: u32) {
+    let key_dir = base_dir.join(pkh.to_b58check());
+    fs::create_dir_all(&key_dir).unwrap();
+
     let buf = encode_entry(level, 0);
 
     for filename in &[
@@ -160,7 +166,7 @@ pub fn preinit_watermarks(base_dir: &Path, level: u32) {
         "preattestation_watermark",
         "attestation_watermark",
     ] {
-        fs::write(base_dir.join(filename), buf).unwrap();
+        fs::write(key_dir.join(filename), buf).unwrap();
     }
 }
 

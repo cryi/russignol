@@ -8,6 +8,10 @@
 //! and fdatasynced to disk before any signature is returned. Each operation
 //! type has a best-effort `.prev` backup for crash recovery.
 //!
+//! Watermarks are tracked per-key, so each public key hash has independent
+//! watermark state. This supports companion key signing (DAL) where both
+//! the consensus key and companion key sign at the same level/round.
+//!
 //! Corresponds to: src/bin_signer/handler.ml:27-232
 
 use crate::bls::PublicKeyHash;
@@ -15,10 +19,11 @@ use crate::magic_bytes::{
     get_level_and_round_for_tenderbake_attestation, get_level_and_round_for_tenderbake_block,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Size of a watermark file: level (4) + round (4) + blake3 (32)
 const WATERMARK_FILE_SIZE: usize = 40;
@@ -92,12 +97,23 @@ impl OperationType {
     }
 }
 
+/// Per-key watermark state: file handles and in-memory cache
+struct PerKeyWatermark {
+    /// Primary file handles, indexed by `OperationType as usize`
+    files: [File; 3],
+    /// Backup (.prev) file handles, indexed by `OperationType as usize`
+    prev_files: [File; 3],
+    /// In-memory cache, indexed by `OperationType as usize`
+    entries: [Option<WatermarkEntry>; 3],
+}
+
 /// Info needed to persist a watermark update to disk.
 ///
 /// Returned from [`HighWatermark::check_and_update`] when the watermark was
 /// advanced. Pass to [`HighWatermark::write_watermark`] to persist.
 #[derive(Debug)]
 pub struct WatermarkUpdate {
+    pkh: PublicKeyHash,
     idx: usize,
     level: u32,
     round: u32,
@@ -175,7 +191,10 @@ pub type Result<T> = std::result::Result<T, WatermarkError>;
 /// High watermark tracker
 ///
 /// Prevents double-signing by tracking the highest level/round signed
-/// for each operation type (block, preattestation, attestation).
+/// for each operation type (block, preattestation, attestation) per key.
+///
+/// Each key gets its own subdirectory under the base watermark directory,
+/// named by its base58check encoding (e.g. `tz4HKYQnfQChmDt.../`).
 ///
 /// Watermarks are stored as 40-byte binary files and fdatasynced before
 /// any signature is returned. All file handles (primary and `.prev` backup)
@@ -183,70 +202,55 @@ pub type Result<T> = std::result::Result<T, WatermarkError>;
 ///
 /// Corresponds to: src/bin_signer/handler.ml:27-232
 pub struct HighWatermark {
-    /// Primary file handles, indexed by `OperationType as usize`
-    files: [File; 3],
-    /// Backup (.prev) file handles, indexed by `OperationType as usize`
-    prev_files: [File; 3],
-    /// In-memory cache, indexed by `OperationType as usize`
-    entries: [Option<WatermarkEntry>; 3],
+    base_dir: PathBuf,
+    /// Set of PKHs this tracker is authorised to manage (fixed at construction).
+    known_pkhs: HashSet<PublicKeyHash>,
+    keys: HashMap<PublicKeyHash, PerKeyWatermark>,
 }
 
 impl HighWatermark {
     /// Create new high watermark tracker
     ///
-    /// Opens (or creates) the three watermark files and loads their entries.
-    /// Falls back to `.prev` if a primary file has a bad hash.
-    pub fn new<P: AsRef<Path>>(base_dir: P) -> io::Result<Self> {
-        let base_dir = base_dir.as_ref();
-        fs::create_dir_all(base_dir)?;
+    /// Loads existing per-key watermark state for the given public key hashes.
+    pub fn new<P: AsRef<Path>>(base_dir: P, pkhs: &[PublicKeyHash]) -> io::Result<Self> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&base_dir)?;
 
-        let mut files_opt: [Option<File>; 3] = [None, None, None];
-        let mut prev_files_opt: [Option<File>; 3] = [None, None, None];
-        let mut entries: [Option<WatermarkEntry>; 3] = [None, None, None];
-
-        for (i, filename) in FILENAMES.iter().enumerate() {
-            let path = base_dir.join(filename);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-
-            let prev_path = base_dir.join(format!("{filename}.prev"));
-            let prev_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&prev_path)?;
-
-            // Try primary, then fall back to .prev
-            entries[i] = load_entry_from_file(&file).or_else(|| {
-                let entry = load_entry_from_file(&prev_file);
-                if entry.is_some() {
-                    log::warn!("Primary watermark {filename} corrupt/missing, loaded from .prev");
-                }
-                entry
-            });
-
-            files_opt[i] = Some(file);
-            prev_files_opt[i] = Some(prev_file);
+        let mut keys = HashMap::new();
+        for pkh in pkhs {
+            let key_dir = base_dir.join(pkh.to_b58check());
+            if key_dir.is_dir() {
+                let per_key = load_per_key_watermark(&key_dir)?;
+                keys.insert(*pkh, per_key);
+            }
         }
 
+        let known_pkhs: HashSet<PublicKeyHash> = pkhs.iter().copied().collect();
         Ok(Self {
-            files: [
-                files_opt[0].take().unwrap(),
-                files_opt[1].take().unwrap(),
-                files_opt[2].take().unwrap(),
-            ],
-            prev_files: [
-                prev_files_opt[0].take().unwrap(),
-                prev_files_opt[1].take().unwrap(),
-                prev_files_opt[2].take().unwrap(),
-            ],
-            entries,
+            base_dir,
+            known_pkhs,
+            keys,
         })
+    }
+
+    /// Ensure a per-key watermark entry exists, creating its subdirectory if needed.
+    ///
+    /// Only PKHs passed at construction are allowed; unknown keys return `NotInitialized`.
+    fn ensure_key(&mut self, pkh: &PublicKeyHash) -> Result<()> {
+        if self.keys.contains_key(pkh) {
+            return Ok(());
+        }
+        if !self.known_pkhs.contains(pkh) {
+            return Err(WatermarkError::NotInitialized {
+                chain_id: String::new(),
+                pkh: pkh.to_b58check(),
+            });
+        }
+        let key_dir = self.base_dir.join(pkh.to_b58check());
+        fs::create_dir_all(&key_dir)?;
+        let per_key = load_per_key_watermark(&key_dir)?;
+        self.keys.insert(*pkh, per_key);
+        Ok(())
     }
 
     /// Check if data can be signed and update in-memory watermark if allowed.
@@ -277,10 +281,12 @@ impl HighWatermark {
             _ => unreachable!(),
         };
 
+        self.ensure_key(pkh)?;
+        let per_key = self.keys.get_mut(pkh).unwrap();
         let idx = op_type as usize;
 
         // Check watermark exists (must be pre-configured before first signature)
-        let Some(current) = self.entries[idx] else {
+        let Some(current) = per_key.entries[idx] else {
             return Err(WatermarkError::NotInitialized {
                 chain_id: chain_id.to_b58check(),
                 pkh: pkh.to_b58check(),
@@ -305,10 +311,11 @@ impl HighWatermark {
         }
 
         // Update in-memory cache (save previous for rollback)
-        let prev = self.entries[idx];
-        self.entries[idx] = Some(WatermarkEntry { level, round });
+        let prev = per_key.entries[idx];
+        per_key.entries[idx] = Some(WatermarkEntry { level, round });
 
         Ok(Some(WatermarkUpdate {
+            pkh: *pkh,
             idx,
             level,
             round,
@@ -321,7 +328,9 @@ impl HighWatermark {
     /// Call this if BLS signing fails after [`check_and_update`](Self::check_and_update)
     /// succeeded, so the baker can retry at the same level.
     pub fn rollback_update(&mut self, update: &WatermarkUpdate) {
-        self.entries[update.idx] = update.prev;
+        if let Some(per_key) = self.keys.get_mut(&update.pkh) {
+            per_key.entries[update.idx] = update.prev;
+        }
     }
 
     /// Write the previous watermark value back to disk after a BLS signing failure.
@@ -331,7 +340,10 @@ impl HighWatermark {
     /// Restores disk state to match the rolled-back in-memory state.
     pub fn rollback_disk_watermark(&self, update: &WatermarkUpdate) -> Result<()> {
         if let Some(prev) = update.prev {
-            let file = &self.files[update.idx];
+            let per_key = self.keys.get(&update.pkh).ok_or_else(|| {
+                WatermarkError::Internal(format!("Unknown key: {}", update.pkh.to_b58check()))
+            })?;
+            let file = &per_key.files[update.idx];
             let buf = encode_entry(prev.level, prev.round);
             file.write_all_at(&buf, 0)?;
             file.sync_data()?;
@@ -348,13 +360,16 @@ impl HighWatermark {
     /// OS writeback and may contain stale data after power loss, which is acceptable
     /// since the main file is always fsynced.
     pub fn write_watermark(&self, update: &WatermarkUpdate) -> Result<()> {
-        let file = &self.files[update.idx];
+        let per_key = self.keys.get(&update.pkh).ok_or_else(|| {
+            WatermarkError::Internal(format!("Unknown key: {}", update.pkh.to_b58check()))
+        })?;
+        let file = &per_key.files[update.idx];
 
         // Best-effort copy current main → .prev (no fsync, reaches disk via OS writeback)
         let mut current = [0u8; WATERMARK_FILE_SIZE];
         if file.read_exact_at(&mut current, 0).is_ok() {
             let filename = FILENAMES[update.idx];
-            if let Err(e) = self.prev_files[update.idx].write_all_at(&current, 0) {
+            if let Err(e) = per_key.prev_files[update.idx].write_all_at(&current, 0) {
                 log::warn!("Failed to write {filename}.prev: {e}");
             }
         }
@@ -395,8 +410,13 @@ impl HighWatermark {
     /// Returns the highest level from any of the three operation types.
     /// Returns None if no watermark exists.
     #[must_use]
-    pub fn get_current_level(&self, _chain_id: ChainId, _pkh: &PublicKeyHash) -> Option<u32> {
-        self.entries.iter().filter_map(|e| e.map(|w| w.level)).max()
+    pub fn get_current_level(&self, _chain_id: ChainId, pkh: &PublicKeyHash) -> Option<u32> {
+        self.keys
+            .get(pkh)?
+            .entries
+            .iter()
+            .filter_map(|e| e.map(|w| w.level))
+            .max()
     }
 
     /// Get current watermark levels for display purposes.
@@ -407,8 +427,15 @@ impl HighWatermark {
         chain_id: ChainId,
         pkh: &PublicKeyHash,
     ) -> Result<(u32, u32, u32)> {
+        let per_key = self
+            .keys
+            .get(pkh)
+            .ok_or_else(|| WatermarkError::NotInitialized {
+                chain_id: chain_id.to_b58check(),
+                pkh: pkh.to_b58check(),
+            })?;
         let get = |idx: usize| -> Result<u32> {
-            self.entries[idx]
+            per_key.entries[idx]
                 .map(|e| e.level)
                 .ok_or_else(|| WatermarkError::NotInitialized {
                     chain_id: chain_id.to_b58check(),
@@ -424,22 +451,108 @@ impl HighWatermark {
     pub fn update_to_level(
         &mut self,
         _chain_id: ChainId,
-        _pkh: &PublicKeyHash,
+        pkh: &PublicKeyHash,
         level: u32,
     ) -> Result<()> {
+        self.ensure_key(pkh)?;
         let entry = WatermarkEntry { level, round: 0 };
-        for (i, op_type) in OperationType::ALL.iter().enumerate() {
-            let prev = self.entries[i];
-            self.entries[i] = Some(entry);
-            self.write_watermark(&WatermarkUpdate {
-                idx: *op_type as usize,
-                level,
-                round: 0,
-                prev,
-            })?;
+
+        // Collect updates, then write (can't borrow self mutably and call write_watermark)
+        let per_key = self.keys.get_mut(pkh).unwrap();
+        let updates: Vec<WatermarkUpdate> = OperationType::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, op_type)| {
+                let prev = per_key.entries[i];
+                per_key.entries[i] = Some(entry);
+                WatermarkUpdate {
+                    pkh: *pkh,
+                    idx: *op_type as usize,
+                    level,
+                    round: 0,
+                    prev,
+                }
+            })
+            .collect();
+
+        for update in &updates {
+            self.write_watermark(update)?;
         }
         Ok(())
     }
+
+    /// Get entry for a specific key and operation type (test-only)
+    #[cfg(test)]
+    pub(crate) fn get_entry(
+        &self,
+        pkh: &PublicKeyHash,
+        op_type: OperationType,
+    ) -> Option<WatermarkEntry> {
+        self.keys.get(pkh)?.entries[op_type as usize]
+    }
+
+    /// Get file handle for a specific key and operation type (test-only)
+    #[cfg(test)]
+    pub(crate) fn get_key_file(
+        &self,
+        pkh: &PublicKeyHash,
+        op_type: OperationType,
+    ) -> Option<&File> {
+        Some(&self.keys.get(pkh)?.files[op_type as usize])
+    }
+}
+
+/// Load or create per-key watermark files from a directory.
+fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
+    fs::create_dir_all(key_dir)?;
+
+    let mut files_opt: [Option<File>; 3] = [None, None, None];
+    let mut prev_files_opt: [Option<File>; 3] = [None, None, None];
+    let mut entries: [Option<WatermarkEntry>; 3] = [None, None, None];
+
+    for (i, filename) in FILENAMES.iter().enumerate() {
+        let path = key_dir.join(filename);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+
+        let prev_path = key_dir.join(format!("{filename}.prev"));
+        let prev_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&prev_path)?;
+
+        // Try primary, then fall back to .prev
+        entries[i] = load_entry_from_file(&file).or_else(|| {
+            let entry = load_entry_from_file(&prev_file);
+            if entry.is_some() {
+                log::warn!("Primary watermark {filename} corrupt/missing, loaded from .prev");
+            }
+            entry
+        });
+
+        files_opt[i] = Some(file);
+        prev_files_opt[i] = Some(prev_file);
+    }
+
+    Ok(PerKeyWatermark {
+        files: [
+            files_opt[0].take().unwrap(),
+            files_opt[1].take().unwrap(),
+            files_opt[2].take().unwrap(),
+        ],
+        prev_files: [
+            prev_files_opt[0].take().unwrap(),
+            prev_files_opt[1].take().unwrap(),
+            prev_files_opt[2].take().unwrap(),
+        ],
+        entries,
+    })
 }
 
 /// Encode a watermark entry as 40 bytes: level (4B BE) + round (4B BE) + blake3 (32B)
@@ -490,11 +603,43 @@ fn load_entry_from_path(path: &Path) -> Option<WatermarkEntry> {
 mod tests {
     use super::*;
     use crate::bls::generate_key;
-    use crate::test_utils::{create_block_data, default_test_chain_id, preinit_watermarks};
+    use crate::test_utils::{
+        create_attestation_data, create_block_data, default_test_chain_id, preinit_watermarks,
+    };
     use tempfile::TempDir;
 
     fn create_test_chain_id() -> ChainId {
         default_test_chain_id()
+    }
+
+    #[test]
+    fn test_per_key_watermark_isolation() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+
+        let seed1 = [42u8; 32];
+        let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
+        let seed2 = [43u8; 32];
+        let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh1, 99);
+        preinit_watermarks(temp_dir.path(), &pkh2, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh1, pkh2]).unwrap();
+
+        // Consensus key signs attestation at (100, 0)
+        let data = create_attestation_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh1, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        // Companion key signs attestation at (100, 0) — should succeed
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh2, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update2).unwrap();
     }
 
     #[test]
@@ -504,8 +649,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data1 = create_block_data(100, 0);
         assert!(hwm.check_and_update(chain_id, &pkh, &data1).is_ok());
@@ -521,8 +666,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data1 = create_block_data(100, 0);
         assert!(hwm.check_and_update(chain_id, &pkh, &data1).is_ok());
@@ -539,8 +684,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data1 = create_block_data(100, 5);
         assert!(hwm.check_and_update(chain_id, &pkh, &data1).is_ok());
@@ -556,8 +701,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data1 = create_block_data(100, 5);
         assert!(hwm.check_and_update(chain_id, &pkh, &data1).is_ok());
@@ -574,8 +719,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data1 = create_block_data(100, 5);
         assert!(hwm.check_and_update(chain_id, &pkh, &data1).is_ok());
@@ -595,11 +740,11 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
 
         // First instance: sign at level 100 and persist
         {
-            let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
             let data = create_block_data(100, 5);
             let update = hwm
                 .check_and_update(chain_id, &pkh, &data)
@@ -610,11 +755,11 @@ mod tests {
 
         // Second instance: load from disk and verify
         {
-            let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
             // Verify loaded entry
             assert_eq!(
-                hwm.entries[OperationType::Block as usize],
+                hwm.get_entry(&pkh, OperationType::Block),
                 Some(WatermarkEntry {
                     level: 100,
                     round: 5
@@ -631,10 +776,10 @@ mod tests {
     #[test]
     fn test_reject_first_signature_without_initialization() {
         let temp_dir = TempDir::new().unwrap();
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
         let chain_id = create_test_chain_id();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data = create_block_data(100, 0);
         let result = hwm.check_and_update(chain_id, &pkh, &data);
@@ -669,8 +814,8 @@ mod tests {
         let seed = [77u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data = create_block_data(100, 5);
         let update = hwm
@@ -680,7 +825,8 @@ mod tests {
         hwm.write_watermark(&update).unwrap();
 
         // Read raw file and verify binary format
-        let raw = fs::read(temp_dir.path().join("block_watermark")).unwrap();
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
+        let raw = fs::read(key_dir.join("block_watermark")).unwrap();
         assert_eq!(raw.len(), 40, "Watermark file must be exactly 40 bytes");
 
         let level = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
@@ -699,11 +845,12 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
 
         // Sign at level 100, persist (creates .prev from init data)
         {
-            let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
             let data = create_block_data(100, 5);
             let update = hwm
                 .check_and_update(chain_id, &pkh, &data)
@@ -714,7 +861,7 @@ mod tests {
 
         // Sign at level 200, persist (copies level 100 to .prev)
         {
-            let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
             let data = create_block_data(200, 3);
             let update = hwm
                 .check_and_update(chain_id, &pkh, &data)
@@ -724,12 +871,12 @@ mod tests {
         }
 
         // Corrupt the primary file
-        fs::write(temp_dir.path().join("block_watermark"), b"corrupted!!!").unwrap();
+        fs::write(key_dir.join("block_watermark"), b"corrupted!!!").unwrap();
 
         // Reload — should fall back to .prev (level 100)
-        let hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
-            hwm.entries[OperationType::Block as usize],
+            hwm.get_entry(&pkh, OperationType::Block),
             Some(WatermarkEntry {
                 level: 100,
                 round: 5
@@ -741,26 +888,24 @@ mod tests {
     #[test]
     fn test_both_files_corrupt_returns_none() {
         let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        // Write garbage to both primary and .prev
-        fs::write(temp_dir.path().join("block_watermark"), b"bad_data_xxx").unwrap();
-        fs::write(
-            temp_dir.path().join("block_watermark.prev"),
-            b"bad_data_xxx",
-        )
-        .unwrap();
+        // Create per-key dir with garbage in both primary and .prev
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
+        fs::create_dir_all(&key_dir).unwrap();
+        fs::write(key_dir.join("block_watermark"), b"bad_data_xxx").unwrap();
+        fs::write(key_dir.join("block_watermark.prev"), b"bad_data_xxx").unwrap();
 
-        let hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
-            hwm.entries[OperationType::Block as usize],
+            hwm.get_entry(&pkh, OperationType::Block),
             None,
             "Both corrupt files should result in None entry"
         );
 
         // Attempting to sign should fail with NotInitialized
         let chain_id = create_test_chain_id();
-        let seed = [42u8; 32];
-        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
         let data = create_block_data(100, 0);
 
         let mut hwm = hwm;
@@ -802,13 +947,17 @@ mod tests {
     #[test]
     fn test_wrong_file_size_rejected() {
         let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
+        fs::create_dir_all(&key_dir).unwrap();
         // Write 8 bytes instead of 40
-        fs::write(temp_dir.path().join("block_watermark"), &[0u8; 8]).unwrap();
+        fs::write(key_dir.join("block_watermark"), &[0u8; 8]).unwrap();
 
-        let hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
-            hwm.entries[OperationType::Block as usize],
+            hwm.get_entry(&pkh, OperationType::Block),
             None,
             "Wrong size file should be rejected"
         );
@@ -821,15 +970,15 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         hwm.update_to_level(chain_id, &pkh, 500).unwrap();
 
         // All three entries should be at level 500
-        for i in 0..3 {
+        for op_type in OperationType::ALL {
             assert_eq!(
-                hwm.entries[i],
+                hwm.get_entry(&pkh, op_type),
                 Some(WatermarkEntry {
                     level: 500,
                     round: 0
@@ -838,10 +987,10 @@ mod tests {
         }
 
         // Reload from disk and verify persistence
-        let hwm2 = HighWatermark::new(temp_dir.path()).unwrap();
-        for i in 0..3 {
+        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        for op_type in OperationType::ALL {
             assert_eq!(
-                hwm2.entries[i],
+                hwm2.get_entry(&pkh, op_type),
                 Some(WatermarkEntry {
                     level: 500,
                     round: 0
@@ -857,8 +1006,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         let data = create_block_data(100, 0);
         let update = hwm
@@ -868,8 +1017,8 @@ mod tests {
         hwm.write_watermark(&update).unwrap();
 
         // .prev should exist and contain the pre-write data (level 99)
-        let prev_entry =
-            load_entry_from_path(&temp_dir.path().join("block_watermark.prev")).unwrap();
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
+        let prev_entry = load_entry_from_path(&key_dir.join("block_watermark.prev")).unwrap();
         assert_eq!(prev_entry.level, 99);
         assert_eq!(prev_entry.round, 0);
     }
@@ -883,8 +1032,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         // Advance preattestation to level 100, round 3
         let data = create_preattestation_data(100, 3);
@@ -907,9 +1056,9 @@ mod tests {
         hwm.write_watermark(&update2).unwrap();
 
         // Reload from disk and verify
-        let hwm2 = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
-            hwm2.entries[OperationType::Preattestation as usize],
+            hwm2.get_entry(&pkh, OperationType::Preattestation),
             Some(WatermarkEntry {
                 level: 100,
                 round: 4
@@ -925,8 +1074,8 @@ mod tests {
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
         // Start with level 0 (the preinit level)
-        preinit_watermarks(temp_dir.path(), 0);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 0);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         // First-ever advance: prev is Some (level 0)
         let data = create_block_data(1, 0);
@@ -940,9 +1089,9 @@ mod tests {
         hwm.rollback_update(&update);
         hwm.rollback_disk_watermark(&update).unwrap();
 
-        let hwm2 = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
-            hwm2.entries[OperationType::Block as usize],
+            hwm2.get_entry(&pkh, OperationType::Block),
             Some(WatermarkEntry { level: 0, round: 0 })
         );
     }
@@ -954,8 +1103,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         // Jump to level 500
         hwm.update_to_level(chain_id, &pkh, 500).unwrap();
@@ -981,8 +1130,8 @@ mod tests {
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        preinit_watermarks(temp_dir.path(), 99);
-        let mut hwm = HighWatermark::new(temp_dir.path()).unwrap();
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
         // Normal write should pass read-back verification
         let data = create_block_data(100, 0);
@@ -997,7 +1146,8 @@ mod tests {
         // attempting a new write_watermark that should pass (since it writes
         // fresh data). This validates the verification runs on the NEW data.
         let corrupt_buf = [0xFFu8; WATERMARK_FILE_SIZE];
-        hwm.files[OperationType::Block as usize]
+        hwm.get_key_file(&pkh, OperationType::Block)
+            .unwrap()
             .write_all_at(&corrupt_buf, 0)
             .unwrap();
 
@@ -1010,7 +1160,8 @@ mod tests {
         assert!(hwm.write_watermark(&update2).is_ok());
 
         // Verify the file is now correct
-        let entry = load_entry_from_file(&hwm.files[OperationType::Block as usize]).unwrap();
+        let entry =
+            load_entry_from_file(hwm.get_key_file(&pkh, OperationType::Block).unwrap()).unwrap();
         assert_eq!(entry.level, 101);
         assert_eq!(entry.round, 0);
     }

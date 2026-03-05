@@ -207,6 +207,7 @@ fn launch_socket_signer(
 
     // Create server key manager and load signers
     let mut server_key_mgr = ServerKeyManager::new();
+    let mut loaded_pkhs = Vec::new();
 
     for (alias, stored_key) in &keys {
         if let Some(sk_b58) = &stored_key.secret_key {
@@ -216,6 +217,7 @@ fn launch_socket_signer(
                     let derived_pkh = *signer.public_key_hash();
                     let derived_pkh_b58 = derived_pkh.to_b58check();
                     server_key_mgr.add_signer(derived_pkh, signer, alias.clone());
+                    loaded_pkhs.push(derived_pkh);
                     let json_pkh = &stored_key.public_key_hash;
                     println!(
                         "  ✓ Loaded key: {alias} (JSON: {json_pkh}, Derived: {derived_pkh_b58})"
@@ -230,9 +232,7 @@ fn launch_socket_signer(
 
     // Setup high watermark if enabled
     let watermark = if opts.check_high_watermark {
-        // Watermark files stored directly in base_dir
-        // Files: block_watermark, preattestation_watermark, attestation_watermark
-        let hwm = HighWatermark::new(cli_key_manager.base_dir())
+        let hwm = HighWatermark::new(cli_key_manager.base_dir(), &loaded_pkhs)
             .map_err(|e| format!("Failed to create high watermark: {e}"))?;
 
         println!("✓ High watermark protection enabled");

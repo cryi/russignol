@@ -31,8 +31,10 @@ fn test_concurrent_signing_serialization() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 99);
-    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
+    let hwm = Arc::new(RwLock::new(
+        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+    ));
 
     // Set watermark to level 100
     {
@@ -99,8 +101,10 @@ fn test_independent_operation_types() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 0);
-    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+    preinit_watermarks(temp_dir.path(), &pkh, 0);
+    let hwm = Arc::new(RwLock::new(
+        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+    ));
     let barrier = Arc::new(Barrier::new(2));
 
     // Thread 1: Sign blocks at levels 1, 2, 3
@@ -141,7 +145,7 @@ fn test_independent_operation_types() {
     attest_thread.join().unwrap();
 
     // Reload from disk and verify persistence
-    let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
+    let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
     let (block, _preattest, attest) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
 
     assert_eq!(block, 3, "Block watermark should be at level 3");
@@ -156,8 +160,10 @@ fn test_stress_concurrent_watermarks() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 0);
-    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+    preinit_watermarks(temp_dir.path(), &pkh, 0);
+    let hwm = Arc::new(RwLock::new(
+        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+    ));
     let num_threads = 8;
     let ops_per_thread = 50;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -232,14 +238,16 @@ fn test_toctou_exploit_attempt() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 99);
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
 
     let iterations = 100;
     let mut double_sign_detected = false;
 
     for _ in 0..iterations {
-        preinit_watermarks(temp_dir.path(), 99);
-        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let hwm = Arc::new(RwLock::new(
+            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+        ));
 
         // Set initial watermark to level 100
         {
@@ -311,8 +319,10 @@ fn test_concurrent_same_level_different_rounds_disk_consistency() {
 
     for _ in 0..iterations {
         let temp_dir = TempDir::new().unwrap();
-        preinit_watermarks(temp_dir.path(), 99);
-        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let hwm = Arc::new(RwLock::new(
+            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+        ));
 
         // Set initial watermark to level 100, round 0
         {
@@ -353,12 +363,13 @@ fn test_concurrent_same_level_different_rounds_disk_consistency() {
         t2.join().unwrap();
 
         // Reload from disk — the file must have the highest round (6)
-        let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
+        let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
         assert_eq!(block_level, 101, "Disk should have level 101");
 
         // Read raw file to verify round
-        let raw = std::fs::read(temp_dir.path().join("block_watermark")).unwrap();
+        let key_dir = temp_dir.path().join(pkh.to_b58check());
+        let raw = std::fs::read(key_dir.join("block_watermark")).unwrap();
         let disk_round = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
         // With serialized write lock, the second request (round 6) always wins
@@ -387,8 +398,10 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 99);
-    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
+    let hwm = Arc::new(RwLock::new(
+        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+    ));
 
     // Advance to level 100, round 0 (baseline)
     {
@@ -422,11 +435,12 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     }
 
     // Reload from disk — should also be level 100, round 0
-    let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
+    let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
     let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
     assert_eq!(block_level, 100, "Disk should be rolled back to level 100");
 
-    let raw = std::fs::read(temp_dir.path().join("block_watermark")).unwrap();
+    let key_dir = temp_dir.path().join(pkh.to_b58check());
+    let raw = std::fs::read(key_dir.join("block_watermark")).unwrap();
     let disk_level = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let disk_round = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
     assert_eq!(disk_level, 100, "Disk file should have level 100");
@@ -455,8 +469,10 @@ fn test_prev_file_is_written() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    preinit_watermarks(temp_dir.path(), 99);
-    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
+    let hwm = Arc::new(RwLock::new(
+        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+    ));
 
     // Advance to level 100
     {
@@ -479,7 +495,8 @@ fn test_prev_file_is_written() {
     }
 
     // Check that .prev file exists and has the previous level (100)
-    let prev_path = temp_dir.path().join("block_watermark.prev");
+    let key_dir = temp_dir.path().join(pkh.to_b58check());
+    let prev_path = key_dir.join("block_watermark.prev");
     assert!(prev_path.exists(), ".prev file should exist");
 
     let raw = std::fs::read(&prev_path).unwrap();

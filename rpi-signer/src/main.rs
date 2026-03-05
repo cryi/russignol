@@ -657,7 +657,11 @@ fn apply_init_watermark(
 ) -> epd_2in13_v4::EpdResult<()> {
     log::info!("Creating high watermark tracker...");
     let config = signer_server::SignerConfig::default();
-    let hwm = signer_server::create_high_watermark(&config)
+    let pkhs: Vec<PublicKeyHash> = tezos_signer::get_keys()
+        .iter()
+        .filter_map(|k| PublicKeyHash::from_b58check(&k.value).ok())
+        .collect();
+    let hwm = signer_server::create_high_watermark(&config, &pkhs)
         .map_err(|e| std::io::Error::other(format!("Failed to create watermark: {e}")))?;
     let Ok(mut wm_lock) = app.watermark.write() else {
         fatal_error(

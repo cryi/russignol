@@ -115,12 +115,12 @@ fn test_tcp_server_sign_with_watermark() {
     let _chain_id = ChainId::from_bytes(&chain_id_bytes);
 
     // Pre-initialize watermarks BEFORE creating HighWatermark
-    preinit_watermarks(temp_dir.path(), 99);
+    preinit_watermarks(temp_dir.path(), &pkh, 99);
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh, signer, "test_key".to_string());
 
-    let watermark = HighWatermark::new(temp_dir.path()).unwrap();
+    let watermark = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),

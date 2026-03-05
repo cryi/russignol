@@ -6,6 +6,7 @@
 //! The watermark config is a one-time use file that is deleted after processing.
 
 use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE, WATERMARK_DIR};
+use crate::tezos_signer;
 use crate::util::run_command;
 use serde::Deserialize;
 use std::fs;
@@ -186,6 +187,12 @@ fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
         "attestation_watermark",
     ];
 
+    // Read PKHs from /keys/public_key_hashs (written during key generation)
+    let keys = tezos_signer::get_keys();
+    if keys.is_empty() {
+        return Err("No keys found - cannot create per-key watermark directories".into());
+    }
+
     // Ensure watermark directory exists
     fs::create_dir_all(WATERMARK_DIR)
         .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
@@ -193,16 +200,27 @@ fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
     let level = config.chain.level;
     let buf = russignol_signer_lib::high_watermark::encode_entry(level, 0);
 
-    for filename in WATERMARK_FILES {
-        let path = Path::new(WATERMARK_DIR).join(filename);
-        fs::write(&path, buf).map_err(|e| format!("Failed to write {filename}: {e}"))?;
-        log::debug!("Created {}", path.display());
+    // Create watermark files in per-key subdirectories
+    for key in &keys {
+        let key_dir = Path::new(WATERMARK_DIR).join(&key.value);
+        fs::create_dir_all(&key_dir)
+            .map_err(|e| format!("Failed to create key directory {}: {e}", key.value))?;
+
+        for filename in WATERMARK_FILES {
+            let path = key_dir.join(filename);
+            fs::write(&path, buf).map_err(|e| format!("Failed to write {filename}: {e}"))?;
+            log::debug!("Created {}", path.display());
+        }
+        log::info!("Watermark files created for {} at level {level}", key.name);
     }
 
     // Change ownership to russignol user (we're still running as root at this point,
     // privileges are dropped later in main.rs after setup is complete)
     run_command("chown", &["-R", "russignol:russignol", WATERMARK_DIR])?;
-    log::info!("Watermark files created at level {level} (40-byte binary format)");
+    log::info!(
+        "Per-key watermarks initialized for {} key(s) at level {level}",
+        keys.len()
+    );
     Ok(())
 }
 

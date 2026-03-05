@@ -102,13 +102,14 @@ pub struct SignerCallbacks {
 /// read-only keys partition.
 pub fn create_high_watermark(
     config: &SignerConfig,
+    pkhs: &[PublicKeyHash],
 ) -> Result<Option<Arc<RwLock<HighWatermark>>>, String> {
     if config.check_high_watermark {
         let hwm_dir = PathBuf::from(&config.watermark_dir);
         fs::create_dir_all(&hwm_dir)
             .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
 
-        let hwm = HighWatermark::new(&hwm_dir)
+        let hwm = HighWatermark::new(&hwm_dir, pkhs)
             .map_err(|e| format!("Failed to create high watermark: {e}"))?;
 
         info!(
