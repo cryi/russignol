@@ -1,6 +1,5 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +10,6 @@ use std::time::{Duration, Instant};
 const BOOST_HOLD: Duration = Duration::from_millis(50);
 
 const SYSFS_POLICY: &str = "/sys/devices/system/cpu/cpufreq/policy0";
-
-/// UID of the russignol user (matches storage.rs)
-const RUSSIGNOL_UID: u32 = 1000;
 
 struct CpuBoostInner {
     setspeed_path: PathBuf,
@@ -40,17 +36,10 @@ pub struct CpuBoost(Arc<CpuBoostInner>);
 impl CpuBoost {
     /// Initialize CPU frequency control.
     ///
-    /// Must be called while running as root (before `drop_privileges`).
-    /// Chowns the sysfs control file so the russignol user can write to it
-    /// after privilege drop.
+    /// The init scripts chown `scaling_setspeed` to russignol before starting
+    /// the signer, so the file is already writable.
     pub fn new() -> io::Result<Self> {
-        let policy_path = Path::new(SYSFS_POLICY);
-        let setspeed_path = policy_path.join("scaling_setspeed");
-
-        // Grant russignol user write access before we drop privileges
-        chown(&setspeed_path, Some(RUSSIGNOL_UID), None)?;
-
-        Self::init(policy_path)
+        Self::init(Path::new(SYSFS_POLICY))
     }
 
     fn init(policy_path: &Path) -> io::Result<Self> {

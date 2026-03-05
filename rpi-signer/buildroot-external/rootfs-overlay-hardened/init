@@ -351,6 +351,9 @@ run_supervisor() {
     # After setup: run as unprivileged russignol user via su with logging
     while true; do
         # Determine if we need root privileges (first boot - no partitions yet)
+        # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
+        chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+
         if ! partition_exists 3 || ! partition_exists 4; then
             # First boot: run as root, no log redirection (would fail anyway)
             $R_CMD

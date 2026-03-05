@@ -81,6 +81,9 @@ case "$1" in
         # First boot (no partitions): run as root for storage setup
         #   - Signer will drop privileges to russignol after storage completes
         # After setup: run as unprivileged russignol user
+        # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
+        chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+
         if ! partition_exists 3 || ! partition_exists 4; then
             echo "First boot detected - running as root for storage setup"
             echo "Signer will drop privileges after partition creation"
