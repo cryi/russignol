@@ -1953,6 +1953,7 @@ dependencies = [
  "russignol-ui",
  "serde",
  "serde_json",
+ "tempfile",
  "tinybmp",
  "u8g2-fonts",
 ]

@@ -2,19 +2,13 @@ use log::{error, info};
 use russignol_signer_lib::{
     ChainId, HighWatermark, RequestHandler, ServerKeyManager, SignerServer, SigningActivity,
     UnencryptedSigner,
+    wallet::OcamlKeyEntry,
 };
-use serde::Deserialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-
-#[derive(Debug, Deserialize)]
-struct OcamlKeyEntry<T> {
-    name: String,
-    value: T,
-}
 
 /// Configuration for the integrated signer
 pub struct SignerConfig {
@@ -93,6 +87,8 @@ pub struct SignerCallbacks {
     pub signing: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called when a large level gap is detected (pkh, `chain_id`, `current_level`, `new_level`)
     pub large_gap: Option<LargeGapCallback>,
+    /// Called before each signing operation (e.g., CPU frequency boost)
+    pub pre_sign: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Create high watermark tracker based on config
@@ -168,13 +164,6 @@ fn run_signer_once(
     // Parse keys directly from memory - never touches disk
     let key_manager = parse_secret_keys(secret_keys_json)?;
 
-    // Create chain ID (mainnet)
-    let _chain_id = ChainId::from_bytes(&[
-        0x7a, 0x06, 0xa7, 0x70, // NetXdQprcVkpaWU (mainnet)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
-
     // Create request handler
     let mut handler = RequestHandler::new(
         Arc::new(RwLock::new(key_manager)),
@@ -196,6 +185,10 @@ fn run_signer_once(
     // Wire up large level gap detection if blocks_per_cycle is configured
     if let (Some(callback), Some(bpc)) = (&callbacks.large_gap, blocks_per_cycle) {
         handler = handler.with_large_gap_callback(callback.clone(), bpc);
+    }
+
+    if let Some(ref callback) = callbacks.pre_sign {
+        handler = handler.with_pre_sign_callback(callback.clone());
     }
 
     // Resolve address

@@ -224,6 +224,8 @@ pub struct RequestHandler {
     large_gap_callback: Option<LargeGapCallback>,
     /// Blocks per cycle (chain-specific, used for gap threshold calculation)
     blocks_per_cycle: Option<u32>,
+    /// Callback invoked at the start of each sign request (e.g., CPU frequency boost)
+    pre_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl RequestHandler {
@@ -246,6 +248,7 @@ impl RequestHandler {
             signing_notify_callback: None,
             large_gap_callback: None,
             blocks_per_cycle: None,
+            pre_sign_callback: None,
         }
     }
 
@@ -285,6 +288,13 @@ impl RequestHandler {
     ) -> Self {
         self.large_gap_callback = Some(callback);
         self.blocks_per_cycle = Some(blocks_per_cycle);
+        self
+    }
+
+    /// Set pre-sign callback (called at the start of each sign request)
+    #[must_use]
+    pub fn with_pre_sign_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.pre_sign_callback = Some(callback);
         self
     }
 
@@ -343,6 +353,10 @@ impl RequestHandler {
             pkh.to_b58check(),
             version
         );
+
+        if let Some(ref callback) = self.pre_sign_callback {
+            callback();
+        }
 
         #[cfg(feature = "perf-trace")]
         let request_start = std::time::Instant::now();

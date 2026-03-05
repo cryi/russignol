@@ -33,5 +33,8 @@ u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
 ctrlc = "3.5"
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 
+[dev-dependencies]
+tempfile = "3.26.0"
+
 # Note: [profile.release] settings moved to workspace Cargo.toml
 # All optimization settings are now applied workspace-wide

@@ -1,6 +1,7 @@
 mod app;
 mod chain_info;
 mod constants;
+mod cpu_freq;
 mod events;
 mod fonts;
 mod network_status;
@@ -108,15 +109,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
             });
         });
 
-    // Set up signal handler - send shutdown event directly to UI loop
-    let tx_for_signal = app_tx.clone();
-    if let Err(e) = ctrlc::set_handler(move || {
-        log::info!("Received Ctrl+C, shutting down...");
-        let _ = tx_for_signal.send(AppEvent::Shutdown);
-    }) {
-        log::error!("Failed to set Ctrl-C handler: {e}");
-        // Continue anyway - Ctrl-C won't work but the app can still function
-    }
+    setup_signal_handler(&app_tx);
 
     // Spawn task that waits for keys to be ready before starting signer
     let signing_activity_clone = signing_activity.clone();
@@ -125,6 +118,11 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let signing_callback_for_signer = Some(signing_notify_callback);
     let large_gap_callback_for_signer = Some(large_gap_callback);
     let tx_for_signer = app_tx.clone();
+
+    let cpu_boost = init_cpu_freq_control();
+    let pre_sign_callback = cpu_boost
+        .clone()
+        .map(|b| Arc::new(move || b.boost()) as Arc<dyn Fn() + Send + Sync>);
 
     let signer_handle = std::thread::spawn(move || {
         // Wait for decrypted secret keys (passed in memory, never written to disk)
@@ -157,6 +155,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 watermark_error: watermark_callback_for_signer,
                 signing: signing_callback_for_signer,
                 large_gap: large_gap_callback_for_signer,
+                pre_sign: pre_sign_callback,
             };
 
             if let Err(e) = signer_server::start_integrated_signer(
@@ -179,6 +178,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
         &app_tx,
         &app_rx,
         &watermark,
+        cpu_boost.as_ref(),
     );
 
     // Signer thread will naturally terminate when the server returns
@@ -195,6 +195,7 @@ fn run_ui_loop(
     tx: &crossbeam_channel::Sender<AppEvent>,
     rx: &crossbeam_channel::Receiver<AppEvent>,
     watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     const SCREENSAVER_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -298,6 +299,7 @@ fn run_ui_loop(
                 &mut current_page,
                 &mut saved_page,
                 &mut shutdown_saved_page,
+                cpu_boost,
             )?;
             if action == LoopAction::Break {
                 break;
@@ -492,6 +494,7 @@ fn apply_effects(
     current_page: &mut Box<dyn Page<Display>>,
     saved_page: &mut Option<Box<dyn Page<Display>>>,
     shutdown_saved_page: &mut Option<Box<dyn Page<Display>>>,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     for effect in effects {
         match effect {
@@ -530,8 +533,8 @@ fn apply_effects(
             Effect::InitWatermark { context } => {
                 apply_init_watermark(app, device, &context)?;
             }
-            Effect::SpawnKeygen { pin } => spawn_keygen(app.tx.clone(), pin),
-            Effect::SpawnPinVerify { pin } => spawn_pin_verify(app.tx.clone(), pin),
+            Effect::SpawnKeygen { pin } => spawn_keygen(app.tx.clone(), pin, cpu_boost),
+            Effect::SpawnPinVerify { pin } => spawn_pin_verify(app.tx.clone(), pin, cpu_boost),
             Effect::SpawnStorageSetup => spawn_storage_setup(app.tx.clone()),
             Effect::SyncDisk => setup::sync_disk(),
             Effect::DropPrivileges => {
@@ -674,19 +677,29 @@ fn apply_init_watermark(
     Ok(())
 }
 
-fn spawn_keygen(tx: Sender<AppEvent>, pin: Vec<u8>) {
-    std::thread::spawn(move || match generate_and_encrypt_keys(&pin) {
-        Ok(json) => {
-            let _ = tx.send(AppEvent::KeyGenSuccess(json));
+fn spawn_keygen(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq::CpuBoost>) {
+    let boost = cpu_boost.cloned();
+    std::thread::spawn(move || {
+        if let Some(ref b) = boost {
+            b.boost();
         }
-        Err(e) => {
-            let _ = tx.send(AppEvent::KeyGenFailed(e));
+        match generate_and_encrypt_keys(&pin) {
+            Ok(json) => {
+                let _ = tx.send(AppEvent::KeyGenSuccess(json));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::KeyGenFailed(e));
+            }
         }
     });
 }
 
-fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>) {
+fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq::CpuBoost>) {
+    let boost = cpu_boost.cloned();
     std::thread::spawn(move || {
+        if let Some(ref b) = boost {
+            b.boost();
+        }
         let start = std::time::Instant::now();
         match tezos_encrypt::decrypt_secret_keys(&pin) {
             Ok(json) => {
@@ -867,6 +880,32 @@ fn generate_and_encrypt_keys(pin: &[u8]) -> Result<String, String> {
     log::info!("Public keys saved");
 
     Ok(secret_keys_json)
+}
+
+fn setup_signal_handler(tx: &crossbeam_channel::Sender<AppEvent>) {
+    let tx_for_signal = tx.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        log::info!("Received Ctrl+C, shutting down...");
+        let _ = tx_for_signal.send(AppEvent::Shutdown);
+    }) {
+        log::error!("Failed to set Ctrl-C handler: {e}");
+    }
+}
+
+/// Initialize CPU frequency control (userspace governor).
+///
+/// Returns `Some(CpuBoost)` if the governor is available, `None` otherwise.
+fn init_cpu_freq_control() -> Option<cpu_freq::CpuBoost> {
+    match cpu_freq::CpuBoost::new() {
+        Ok(boost) => {
+            boost.spawn_watcher();
+            Some(boost)
+        }
+        Err(e) => {
+            log::warn!("CPU freq control unavailable: {e}");
+            None
+        }
+    }
 }
 
 /// Build OCaml-compatible `secret_keys` JSON from in-memory keys

@@ -1,3 +1,10 @@
+# Device
+
+- **SSH**: `sshpass -p russignol ssh russignol@russignol`
+- **Hardware**: Raspberry Pi Zero 2W (BCM2710A1 / Cortex-A53, ARMv8.0-A)
+- **Display**: Waveshare 2.13" Touch e-Paper HAT V4 (SPI: SSD1680Z8, I2C: GT1151Q)
+- **Workload**: ~3 BLS12-381 signatures (~6ms each) every ~6 seconds; idle 99.9% of the time
+
 # Build and Test
 
 Use xtask for all build and test operations:
