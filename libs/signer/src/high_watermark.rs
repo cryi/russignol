@@ -25,15 +25,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-/// Size of a watermark file: level (4) + round (4) + blake3 (32)
-const WATERMARK_FILE_SIZE: usize = 40;
-
-/// File names for each operation type, indexed by `OperationType as usize`
-const FILENAMES: [&str; 3] = [
-    "block_watermark",
-    "preattestation_watermark",
-    "attestation_watermark",
-];
+use russignol_storage::watermark::{FILE_SIZE as WATERMARK_FILE_SIZE, FILENAMES};
 
 /// Chain identifier (32 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -645,22 +637,12 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
 
 /// Encode a watermark entry as 40 bytes: level (4B BE) + round (4B BE) + blake3 (32B)
 pub fn encode_entry(level: u32, round: u32) -> [u8; WATERMARK_FILE_SIZE] {
-    let mut buf = [0u8; WATERMARK_FILE_SIZE];
-    buf[0..4].copy_from_slice(&level.to_be_bytes());
-    buf[4..8].copy_from_slice(&round.to_be_bytes());
-    let hash = blake3::hash(&buf[0..8]);
-    buf[8..40].copy_from_slice(hash.as_bytes());
-    buf
+    russignol_storage::watermark::encode(level, round)
 }
 
 /// Decode a 40-byte buffer into a watermark entry, validating Blake3 hash.
 fn decode_entry(buf: &[u8; WATERMARK_FILE_SIZE]) -> Option<WatermarkEntry> {
-    let level = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let round = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    let computed = blake3::hash(&buf[0..8]);
-    if buf[8..40] != *computed.as_bytes() {
-        return None;
-    }
+    let (level, round) = russignol_storage::watermark::decode(buf)?;
     Some(WatermarkEntry { level, round })
 }
 

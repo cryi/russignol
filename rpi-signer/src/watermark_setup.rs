@@ -181,11 +181,7 @@ fn validate_config(config: &WatermarkConfig) -> Result<(), String> {
 }
 
 fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
-    const WATERMARK_FILES: &[&str] = &[
-        "block_watermark",
-        "preattestation_watermark",
-        "attestation_watermark",
-    ];
+    use russignol_storage::watermark::FILENAMES as WATERMARK_FILES;
 
     // Read PKHs from /keys/public_key_hashs (written during key generation)
     let keys = tezos_signer::get_keys();
@@ -198,7 +194,7 @@ fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
 
     let level = config.chain.level;
-    let buf = russignol_signer_lib::high_watermark::encode_entry(level, 0);
+    let buf = russignol_storage::watermark::encode(level, 0);
 
     // Create watermark files in per-key subdirectories
     for key in &keys {

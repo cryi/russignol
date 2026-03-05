@@ -1910,7 +1910,6 @@ name = "russignol-setup"
 version = "0.19.1"
 dependencies = [
  "anyhow",
- "blake3",
  "chrono",
  "clap",
  "clap_complete",
@@ -1977,6 +1976,7 @@ dependencies = [
  "log",
  "num-bigint",
  "proptest",
+ "russignol-storage",
  "serde",
  "serde_json",
  "sha2",
@@ -1987,6 +1987,9 @@ dependencies = [
 [[package]]
 name = "russignol-storage"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+]
 
 [[package]]
 name = "russignol-ui"

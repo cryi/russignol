@@ -7,3 +7,6 @@ description = "Shared storage constants and utilities for Russignol"
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3 = "1.8.3"

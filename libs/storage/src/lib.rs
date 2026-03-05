@@ -1,3 +1,5 @@
+pub mod watermark;
+
 use core::fmt;
 
 /// 16 MB minimum alignment for partition boundaries

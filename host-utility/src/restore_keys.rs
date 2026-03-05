@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE};
+use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE, watermark};
 
 use crate::image;
 use crate::progress;
@@ -20,6 +20,15 @@ use crate::utils::{self, get_partition_path};
 
 /// Re-export for callers and tests.
 pub type RestorePartitionLayout = russignol_storage::PartitionLayout;
+
+/// Watermark data for a single key, held in memory only.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct PerKeyWatermarkBackup {
+    pkh: String,
+    block: Option<Vec<u8>>,
+    preattestation: Option<Vec<u8>>,
+    attestation: Option<Vec<u8>>,
+}
 
 /// Key data read from a source card, held in memory only.
 ///
@@ -30,9 +39,7 @@ pub struct SourceBackup {
     pub public_keys: Vec<u8>,
     pub public_key_hashs: Vec<u8>,
     pub chain_info: Vec<u8>,
-    pub block_watermark: Option<Vec<u8>>,
-    pub attestation_watermark: Option<Vec<u8>>,
-    pub preattestation_watermark: Option<Vec<u8>>,
+    watermarks: Vec<PerKeyWatermarkBackup>,
 }
 
 /// Calculate restore partition layout from sfdisk JSON output.
@@ -256,9 +263,21 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         .context("Failed to mount source data partition")?;
 
     let watermarks_dir = p4_mount.join("watermarks");
-    let block_watermark = fs::read(watermarks_dir.join("block_watermark")).ok();
-    let attestation_watermark = fs::read(watermarks_dir.join("attestation_watermark")).ok();
-    let preattestation_watermark = fs::read(watermarks_dir.join("preattestation_watermark")).ok();
+    let mut watermarks = Vec::new();
+    if let Ok(entries) = fs::read_dir(&watermarks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let pkh = entry.file_name().to_string_lossy().into_owned();
+                watermarks.push(PerKeyWatermarkBackup {
+                    block: fs::read(path.join(watermark::FILENAMES[0])).ok(),
+                    preattestation: fs::read(path.join(watermark::FILENAMES[1])).ok(),
+                    attestation: fs::read(path.join(watermark::FILENAMES[2])).ok(),
+                    pkh,
+                });
+            }
+        }
+    }
 
     // p4 reads use .ok() so they can't fail, but unmount consistently
     utils::unmount_partition(&p4_mount, &p4_path)?;
@@ -268,9 +287,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         public_keys,
         public_key_hashs,
         chain_info,
-        block_watermark,
-        attestation_watermark,
-        preattestation_watermark,
+        watermarks,
     })
 }
 
@@ -406,19 +423,22 @@ pub fn write_backup_to_target(device: &Path, backup: &SourceBackup) -> Result<()
 
     let p4_result = (|| {
         let watermarks_dir = p4_mount.join("watermarks");
-        fs::create_dir_all(&watermarks_dir).context("Failed to create watermarks directory")?;
-
-        if let Some(ref data) = backup.block_watermark {
-            fs::write(watermarks_dir.join("block_watermark"), data)
-                .context("Failed to write block_watermark")?;
-        }
-        if let Some(ref data) = backup.attestation_watermark {
-            fs::write(watermarks_dir.join("attestation_watermark"), data)
-                .context("Failed to write attestation_watermark")?;
-        }
-        if let Some(ref data) = backup.preattestation_watermark {
-            fs::write(watermarks_dir.join("preattestation_watermark"), data)
-                .context("Failed to write preattestation_watermark")?;
+        for per_key in &backup.watermarks {
+            let key_dir = watermarks_dir.join(&per_key.pkh);
+            fs::create_dir_all(&key_dir)
+                .with_context(|| format!("Failed to create watermark dir for {}", per_key.pkh))?;
+            if let Some(ref data) = per_key.block {
+                fs::write(key_dir.join(watermark::FILENAMES[0]), data)
+                    .context("Failed to write block_watermark")?;
+            }
+            if let Some(ref data) = per_key.preattestation {
+                fs::write(key_dir.join(watermark::FILENAMES[1]), data)
+                    .context("Failed to write preattestation_watermark")?;
+            }
+            if let Some(ref data) = per_key.attestation {
+                fs::write(key_dir.join(watermark::FILENAMES[2]), data)
+                    .context("Failed to write attestation_watermark")?;
+            }
         }
         Ok(())
     })();
@@ -481,18 +501,9 @@ fn parse_chain_info(chain_info: &[u8]) -> Option<(String, String)> {
 }
 
 /// Extract the watermark level from a 40-byte binary watermark file.
-///
-/// Format: level (4B big-endian u32) + round (4B big-endian u32) + blake3 (32B)
-fn extract_watermark_level(watermark: &[u8]) -> Option<u32> {
-    if watermark.len() != 40 {
-        return None;
-    }
-    let level = u32::from_be_bytes(watermark[0..4].try_into().ok()?);
-    let computed = blake3::hash(&watermark[0..8]);
-    if watermark[8..40] != *computed.as_bytes() {
-        return None;
-    }
-    Some(level)
+fn extract_watermark_level(data: &[u8]) -> Option<u32> {
+    let buf: &[u8; watermark::FILE_SIZE] = data.try_into().ok()?;
+    watermark::decode(buf).map(|(level, _)| level)
 }
 
 /// Map a key alias to a user-friendly label
@@ -577,8 +588,11 @@ pub fn confirm_restore_operation(
         lines.push(format!("Chain: {name} ({id})"));
     }
 
-    if let Some(ref wm) = backup.block_watermark
-        && let Some(level) = extract_watermark_level(wm)
+    if let Some(level) = backup
+        .watermarks
+        .iter()
+        .filter_map(|pk| pk.block.as_deref())
+        .find_map(extract_watermark_level)
     {
         lines.push(format!(
             "Head Level: {}",
@@ -943,9 +957,12 @@ mod tests {
             public_keys: vec![5, 6, 7],
             public_key_hashs: vec![8, 9],
             chain_info: vec![10, 11, 12],
-            block_watermark: Some(vec![13, 14]),
-            attestation_watermark: Some(vec![15, 16]),
-            preattestation_watermark: Some(vec![17, 18]),
+            watermarks: vec![PerKeyWatermarkBackup {
+                pkh: "tz4test".into(),
+                block: Some(vec![13, 14]),
+                preattestation: Some(vec![15, 16]),
+                attestation: Some(vec![17, 18]),
+            }],
         };
 
         backup.zeroize();
@@ -954,9 +971,7 @@ mod tests {
         assert!(backup.public_keys.is_empty());
         assert!(backup.public_key_hashs.is_empty());
         assert!(backup.chain_info.is_empty());
-        assert!(backup.block_watermark.is_none());
-        assert!(backup.attestation_watermark.is_none());
-        assert!(backup.preattestation_watermark.is_none());
+        assert!(backup.watermarks.is_empty());
     }
 
     #[test]
