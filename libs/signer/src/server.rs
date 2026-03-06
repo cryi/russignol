@@ -228,8 +228,10 @@ pub struct RequestHandler {
     large_gap_callback: Option<LargeGapCallback>,
     /// Blocks per cycle (chain-specific, used for gap threshold calculation)
     blocks_per_cycle: Option<u32>,
-    /// Callback invoked at the start of each sign request (e.g., CPU frequency boost)
+    /// Callback invoked before each sign request (e.g., CPU frequency boost)
     pre_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Callback invoked after each sign request (e.g., CPU frequency restore)
+    post_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl RequestHandler {
@@ -253,6 +255,7 @@ impl RequestHandler {
             large_gap_callback: None,
             blocks_per_cycle: None,
             pre_sign_callback: None,
+            post_sign_callback: None,
         }
     }
 
@@ -302,6 +305,27 @@ impl RequestHandler {
         self
     }
 
+    /// Set post-sign callback (called after each sign request completes or fails)
+    #[must_use]
+    pub fn with_post_sign_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.post_sign_callback = Some(callback);
+        self
+    }
+
+    /// Notify that a request has been received (e.g., boost CPU frequency).
+    pub fn notify_request_received(&self) {
+        if let Some(ref callback) = self.pre_sign_callback {
+            callback();
+        }
+    }
+
+    /// Notify that request processing is complete (e.g., restore CPU frequency).
+    pub fn notify_request_complete(&self) {
+        if let Some(ref callback) = self.post_sign_callback {
+            callback();
+        }
+    }
+
     /// Handle a signer request
     ///
     /// # Errors
@@ -314,10 +338,7 @@ impl RequestHandler {
                 pkh,
                 data,
                 signature: _,
-            } => {
-                let (response, chain_id) = self.handle_sign(pkh, &data)?;
-                Ok((response, chain_id))
-            }
+            } => self.handle_sign(pkh, &data),
             SignerRequest::PublicKey { pkh } => {
                 self.handle_public_key(pkh).map(|resp| (resp, None))
             }
@@ -362,10 +383,6 @@ impl RequestHandler {
             pkh.to_b58check(),
             version
         );
-
-        if let Some(ref callback) = self.pre_sign_callback {
-            callback();
-        }
 
         #[cfg(feature = "perf-trace")]
         let request_start = std::time::Instant::now();
@@ -754,13 +771,30 @@ fn handle_connection(
     configure_socket(&socket, timeout)?;
 
     let mut request_count = 0;
+    let mut peek_buf = [0u8; 1];
     loop {
         request_count += 1;
         log::debug!("Waiting for request #{request_count} from {addr}");
 
+        // Block at min freq until data arrives on the socket
+        match socket.peek(&mut peek_buf) {
+            Ok(0) => return Ok(()), // Client closed connection
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(Error::Timeout);
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Data has arrived — boost CPU immediately
+        handler.notify_request_received();
+
         let Some(msg_len) =
             read_message_length(&mut socket, addr, request_count, max_message_size)?
         else {
+            handler.notify_request_complete();
             return Ok(()); // Client closed connection
         };
 
@@ -769,7 +803,9 @@ fn handle_connection(
         #[cfg(feature = "perf-trace")]
         let request_start = std::time::Instant::now();
 
-        process_request(&mut socket, addr, msg_len, handler)?;
+        let result = process_request(&mut socket, addr, msg_len, handler);
+        handler.notify_request_complete();
+        result?;
 
         #[cfg(feature = "perf-trace")]
         eprintln!(

@@ -88,6 +88,8 @@ pub struct SignerCallbacks {
     pub large_gap: Option<LargeGapCallback>,
     /// Called before each signing operation (e.g., CPU frequency boost)
     pub pre_sign: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called after each signing operation (e.g., CPU frequency restore)
+    pub post_sign: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Create high watermark tracker based on config
@@ -188,6 +190,9 @@ fn run_signer_once(
 
     if let Some(ref callback) = callbacks.pre_sign {
         handler = handler.with_pre_sign_callback(callback.clone());
+    }
+    if let Some(ref callback) = callbacks.post_sign {
+        handler = handler.with_post_sign_callback(callback.clone());
     }
 
     // Resolve address

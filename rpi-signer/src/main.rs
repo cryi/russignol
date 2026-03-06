@@ -117,9 +117,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let tx_for_signer = app_tx.clone();
 
     let cpu_boost = init_cpu_freq_control();
-    let pre_sign_callback = cpu_boost
-        .clone()
-        .map(|b| Arc::new(move || b.boost()) as Arc<dyn Fn() + Send + Sync>);
+    let (pre_sign_callback, post_sign_callback) = cpu_boost_callbacks(cpu_boost.as_ref());
 
     let signer_handle = std::thread::spawn(move || {
         // Wait for decrypted secret keys (passed in memory, never written to disk)
@@ -153,6 +151,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 signing: signing_callback_for_signer,
                 large_gap: large_gap_callback_for_signer,
                 pre_sign: pre_sign_callback,
+                post_sign: post_sign_callback,
             };
 
             if let Err(e) = signer_server::start_integrated_signer(
@@ -688,7 +687,11 @@ fn spawn_keygen(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq:
         if let Some(ref b) = boost {
             b.boost();
         }
-        match generate_and_encrypt_keys(&pin) {
+        let result = generate_and_encrypt_keys(&pin);
+        if let Some(ref b) = boost {
+            b.restore();
+        }
+        match result {
             Ok(json) => {
                 let _ = tx.send(AppEvent::KeyGenSuccess(json));
             }
@@ -706,7 +709,11 @@ fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_f
             b.boost();
         }
         let start = std::time::Instant::now();
-        match tezos_encrypt::decrypt_secret_keys(&pin) {
+        let result = tezos_encrypt::decrypt_secret_keys(&pin);
+        if let Some(ref b) = boost {
+            b.restore();
+        }
+        match result {
             Ok(json) => {
                 log::info!("Decrypting time: {:?}", start.elapsed());
                 let _ = tx.send(AppEvent::PinVerified(json));
@@ -902,14 +909,28 @@ fn setup_signal_handler(tx: &crossbeam_channel::Sender<AppEvent>) {
 /// Returns `Some(CpuBoost)` if the governor is available, `None` otherwise.
 fn init_cpu_freq_control() -> Option<cpu_freq::CpuBoost> {
     match cpu_freq::CpuBoost::new() {
-        Ok(boost) => {
-            boost.spawn_watcher();
-            Some(boost)
-        }
+        Ok(boost) => Some(boost),
         Err(e) => {
             log::warn!("CPU freq control unavailable: {e}");
             None
         }
+    }
+}
+
+type Callback = Option<Arc<dyn Fn() + Send + Sync>>;
+
+/// Create pre/post sign callbacks that bracket signing with CPU frequency boost/restore.
+fn cpu_boost_callbacks(cpu_boost: Option<&cpu_freq::CpuBoost>) -> (Callback, Callback) {
+    match cpu_boost {
+        Some(b) => {
+            let b1 = b.clone();
+            let b2 = b.clone();
+            (
+                Some(Arc::new(move || b1.boost())),
+                Some(Arc::new(move || b2.restore())),
+            )
+        }
+        None => (None, None),
     }
 }
 
