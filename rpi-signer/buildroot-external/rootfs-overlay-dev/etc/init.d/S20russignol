@@ -71,54 +71,61 @@ mount_data_partition() {
 }
 
 case "$1" in
-    start)
-        echo "Starting Russignol"
+start)
+    # Disable activity LED (~1mA / 5mW saving)
+    echo 0 >/sys/class/leds/led0/brightness 2>/dev/null
 
-        # Mount partitions (if they exist)
-        mount_keys_partition
-        mount_data_partition
+    echo "Starting Russignol"
 
-        # First boot (no partitions): run as root for storage setup
-        #   - Signer will drop privileges to russignol after storage completes
-        # After setup: run as unprivileged russignol user
-        # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
-        chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+    # Mount partitions (if they exist)
+    mount_keys_partition
+    mount_data_partition
 
-        if ! partition_exists 3 || ! partition_exists 4; then
-            echo "First boot detected - running as root for storage setup"
-            echo "Signer will drop privileges after partition creation"
-            start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
-                --chdir /home/russignol \
-                --background --startas /bin/sh -- -c "$COMMAND"
-        else
-            echo "Normal boot - running as $USER"
-            start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
-                --chuid "$USER" \
-                --chdir /home/russignol \
-                --background --startas /bin/sh -- -c "$COMMAND"
-        fi
-        if [ $? -ne 0 ]; then
-            echo "Failed to start Russignol" >&2
-            exit 1
-        fi
-        ;;
-    stop)
-        echo "Stopping Russignol the Tezos Signer"
-        start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5
-        if [ $? -ne 0 ]; then
-            echo "Failed to stop Russignol" >&2
-            exit 1
-        fi
-        ;;
-    restart)
-        "$0" stop
-        sleep 1
-        "$0" start
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart}"
+    # First boot (no partitions): run as root for storage setup
+    #   - Signer will drop privileges to russignol after storage completes
+    # After setup: run as unprivileged russignol user
+    # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
+    chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+
+    if ! partition_exists 3 || ! partition_exists 4; then
+        echo "First boot detected - running as root for storage setup"
+        echo "Signer will drop privileges after partition creation"
+        start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+            --chdir /home/russignol \
+            --background --startas /bin/sh -- -c "$COMMAND"
+    else
+        echo "Normal boot - running as $USER"
+        mkdir -p /data/logs
+        chown "$USER" /data/logs
+        # Rotate log: keep one previous boot's log
+        [ -f /data/logs/signer.log ] && mv /data/logs/signer.log /data/logs/signer.log.old
+        start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+            --chuid "$USER" \
+            --chdir /home/russignol \
+            --background --startas /bin/sh -- -c "$COMMAND >>/data/logs/signer.log 2>&1"
+    fi
+    if [ $? -ne 0 ]; then
+        echo "Failed to start Russignol" >&2
         exit 1
-        ;;
+    fi
+    ;;
+stop)
+    echo "Stopping Russignol the Tezos Signer"
+    start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5
+    if [ $? -ne 0 ]; then
+        echo "Failed to stop Russignol" >&2
+        exit 1
+    fi
+    ;;
+restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
 esac
 
 exit 0

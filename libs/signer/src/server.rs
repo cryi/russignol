@@ -770,31 +770,26 @@ fn handle_connection(
     log::debug!("handle_connection started for {addr}");
     configure_socket(&socket, timeout)?;
 
+    // Boost CPU for entire connection (covers all requests in the burst)
+    handler.notify_request_received();
+    let result = handle_connection_inner(&mut socket, addr, handler, max_message_size);
+    handler.notify_request_complete();
+    result
+}
+
+fn handle_connection_inner(
+    socket: &mut TcpStream,
+    addr: SocketAddr,
+    handler: &Arc<RequestHandler>,
+    max_message_size: usize,
+) -> Result<()> {
     let mut request_count = 0;
-    let mut peek_buf = [0u8; 1];
     loop {
         request_count += 1;
         log::debug!("Waiting for request #{request_count} from {addr}");
 
-        // Block at min freq until data arrives on the socket
-        match socket.peek(&mut peek_buf) {
-            Ok(0) => return Ok(()), // Client closed connection
-            Ok(_) => {}
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Err(Error::Timeout);
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        // Data has arrived — boost CPU immediately
-        handler.notify_request_received();
-
-        let Some(msg_len) =
-            read_message_length(&mut socket, addr, request_count, max_message_size)?
+        let Some(msg_len) = read_message_length(socket, addr, request_count, max_message_size)?
         else {
-            handler.notify_request_complete();
             return Ok(()); // Client closed connection
         };
 
@@ -803,9 +798,7 @@ fn handle_connection(
         #[cfg(feature = "perf-trace")]
         let request_start = std::time::Instant::now();
 
-        let result = process_request(&mut socket, addr, msg_len, handler);
-        handler.notify_request_complete();
-        result?;
+        process_request(socket, addr, msg_len, handler)?;
 
         #[cfg(feature = "perf-trace")]
         eprintln!(

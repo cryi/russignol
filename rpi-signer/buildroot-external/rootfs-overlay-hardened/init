@@ -377,6 +377,9 @@ log_debug "Before init_mounts"
 init_mounts
 log_debug "After init_mounts"
 
+log_debug "Disabling activity LED"
+echo 0 > /sys/class/leds/led0/brightness 2>/dev/null
+
 log_debug "Before init_mdev"
 init_mdev
 log_debug "After init_mdev"

@@ -39,7 +39,9 @@ pub fn build_rpi_signer(dev: bool) -> Result<()> {
     // Build signer package
     let mut cargo_args = vec!["build", "--package", SIGNER_PACKAGE, "--target", TARGET];
 
-    if !dev {
+    if dev {
+        cargo_args.extend(["--features", "russignol-signer-lib/perf-trace"]);
+    } else {
         cargo_args.push("--release");
     }
 
