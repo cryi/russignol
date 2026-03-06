@@ -96,11 +96,17 @@ impl CommitType {
         }
     }
 
-    /// Whether this commit type should appear in user-facing changelogs
-    fn is_user_facing(self) -> bool {
-        matches!(self, Self::Feat | Self::Fix | Self::Perf)
+    /// Whether this commit type should be excluded from changelogs
+    fn is_excluded(self) -> bool {
+        matches!(
+            self,
+            Self::Docs | Self::Refactor | Self::Test | Self::Style | Self::Ci | Self::Other
+        )
     }
 }
+
+/// Scopes excluded from release changelogs (not part of the shipped product)
+const EXCLUDED_SCOPES: &[&str] = &["website"];
 
 /// A parsed conventional commit
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +116,15 @@ pub struct ParsedCommit {
     pub description: String,
     pub hash: String,
     pub breaking: bool,
+}
+
+impl ParsedCommit {
+    /// Whether this commit's scope is excluded from release changelogs
+    fn is_excluded_scope(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|s| EXCLUDED_SCOPES.contains(&s.as_str()))
+    }
 }
 
 /// Parse a commit line in format "hash|subject"
@@ -286,6 +301,26 @@ pub fn fetch_remote_tags() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Get full commit messages (subject + body) for a range, for Claude context
+pub fn get_full_commit_messages(tag: Option<&str>, end_ref: &str) -> Result<String> {
+    let range = match tag {
+        Some(t) => format!("{t}..{end_ref}"),
+        None => end_ref.to_string(),
+    };
+
+    let output = Command::new("git")
+        .args(["log", &range, "--format=### %h %s%n%b"])
+        .stdout(Stdio::piped())
+        .output()
+        .context("Failed to run git log")?;
+
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Get commits since a tag (or all commits if no tag), optionally filtered by scope
@@ -545,6 +580,80 @@ pub fn generate_changelog(
     output
 }
 
+/// Generate a user-facing changelog using Claude CLI
+///
+/// Passes the full commit messages through `claude -p` which generates a formatted
+/// changelog emphasizing user benefits. Falls back gracefully if `claude` is not
+/// installed or the generation fails.
+fn generate_with_claude(
+    version: &str,
+    date: &str,
+    previous_tag: Option<&str>,
+    full_messages: &str,
+) -> Result<String> {
+    let compare_link = previous_tag
+        .map(|prev| {
+            format!(
+                "\n**Full Changelog**: \
+                 https://github.com/RichAyotte/russignol/compare/{prev}...v{version}\n"
+            )
+        })
+        .unwrap_or_default();
+
+    let prompt = format!(
+        "Russignol is a Tezos blockchain signer that runs on a Raspberry Pi Zero 2W. \
+         It signs consensus operations (blocks and attestations) using BLS12-381 keys. \
+         The device runs 24/7 in a home environment, so power consumption, temperature, \
+         reliability, and security are key concerns for users. The host utility runs on \
+         the user's desktop to manage the device (flashing SD cards, backing up keys, \
+         upgrading firmware).\n\n\
+         Generate a changelog from these git commits. Group entries under these markdown \
+         sections in order: Added, Fixed, Changed, Chores. Only include sections that \
+         have entries. Each entry should be a bullet point: `- **scope:** description (hash)` \
+         or `- description (hash)` if no scope. Descriptions should emphasize user-facing \
+         benefits (reliability, power efficiency, temperature, performance, security, \
+         usability) instead of implementation details. Be concise — each description \
+         should be a single short sentence.\n\n\
+         Skip commits with type docs, refactor, test, style, ci, or scope website. \
+         Skip release meta-commits (chore(release), chore(xtask)).\n\n\
+         When a fix commit is a follow-up correction to a new feature introduced in the \
+         same release, fold its details into the parent feature's description instead of \
+         listing it as a separate fix. Only list a commit under Fixed if it fixes a bug \
+         that existed in a previous release.\n\n\
+         Start with this exact header line:\n\
+         ## [{version}] - {date}\n\n\
+         End with this exact line:\n\
+         {compare_link}\n\
+         Format as GitHub Flavored Markdown. \
+         Output only the changelog with no surrounding commentary.\n\n\
+         Here are the full commit messages:\n\n{full_messages}"
+    );
+
+    let output = Command::new("claude")
+        .args(["--print", "--model", "sonnet", &prompt])
+        .env_remove("CLAUDECODE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to run claude CLI")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("claude exited with {}: {stderr}", output.status);
+    }
+
+    let rewritten = String::from_utf8(output.stdout)
+        .context("claude output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    if rewritten.is_empty() {
+        bail!("claude returned empty output");
+    }
+
+    Ok(rewritten)
+}
+
 fn format_commit(commit: &ParsedCommit) -> String {
     if let Some(scope) = &commit.scope {
         format!(
@@ -594,11 +703,14 @@ pub fn create_changelog_file_for_component(
 
     let commit_lines = get_commits_since(tag.as_deref(), &end_ref, scope_filter)?;
 
-    // Only include user-facing commits (feat, fix, perf) and breaking changes
+    // Include all commit types except excluded ones (docs, refactor, test, style, ci, other),
+    // release meta-commits, and non-product scopes like website
     let commits: Vec<ParsedCommit> = commit_lines
         .iter()
         .filter_map(|line| parse_commit(line))
-        .filter(|c| c.breaking || c.commit_type.is_user_facing())
+        .filter(|c| !c.commit_type.is_excluded())
+        .filter(|c| !c.is_excluded_scope())
+        .filter(|c| !is_release_commit(c))
         .collect();
 
     // Get date: if tag exists, use tag date; otherwise use current date
@@ -608,7 +720,12 @@ pub fn create_changelog_file_for_component(
         get_current_date()
     };
 
-    let changelog = generate_changelog(version, &date, tag.as_deref(), &commits);
+    let full_messages = get_full_commit_messages(tag.as_deref(), &end_ref).unwrap_or_default();
+    let changelog =
+        generate_with_claude(version, &date, tag.as_deref(), &full_messages).unwrap_or_else(|e| {
+            eprintln!("  Note: Claude generation skipped ({e}), using raw commit messages");
+            generate_changelog(version, &date, tag.as_deref(), &commits)
+        });
 
     // Include component prefix in filename if present
     let path = if let Some(prefix) = component_prefix {
