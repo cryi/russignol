@@ -538,13 +538,13 @@ pub fn print_restore_success() {
 /// manifest, or source had no manifest (pre-manifest card).
 fn is_source_card(device: &Path, backup: &SourceBackup) -> bool {
     let target_id = image::read_card_id(device);
-    card_ids_match(&backup.source_card_id, &target_id)
+    card_ids_match(backup.source_card_id.as_deref(), target_id.as_deref())
 }
 
 /// Pure comparison: do the source and target card IDs indicate the same card?
 ///
 /// Returns `true` only when both IDs are `Some` and equal.
-fn card_ids_match(source: &Option<String>, target: &Option<String>) -> bool {
+fn card_ids_match(source: Option<&str>, target: Option<&str>) -> bool {
     matches!((source, target), (Some(s), Some(t)) if s == t)
 }
 
@@ -829,10 +829,7 @@ fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str
     spinner.finish_and_clear();
 
     let desc = describe_card(device);
-    utils::success(&format!(
-        "{} card ready ({desc})",
-        uppercase_first(label)
-    ));
+    utils::success(&format!("{} card ready ({desc})", uppercase_first(label)));
 
     Ok(())
 }
@@ -1021,33 +1018,27 @@ mod tests {
 
     #[test]
     fn test_card_ids_match_both_same() {
-        let source = Some("aabbccdd".to_string());
-        let target = Some("aabbccdd".to_string());
-        assert!(card_ids_match(&source, &target));
+        assert!(card_ids_match(Some("aabbccdd"), Some("aabbccdd")));
     }
 
     #[test]
     fn test_card_ids_match_both_different() {
-        let source = Some("aabbccdd".to_string());
-        let target = Some("11223344".to_string());
-        assert!(!card_ids_match(&source, &target));
+        assert!(!card_ids_match(Some("aabbccdd"), Some("11223344")));
     }
 
     #[test]
     fn test_card_ids_match_source_none() {
-        let target = Some("aabbccdd".to_string());
-        assert!(!card_ids_match(&None, &target));
+        assert!(!card_ids_match(None, Some("aabbccdd")));
     }
 
     #[test]
     fn test_card_ids_match_target_none() {
-        let source = Some("aabbccdd".to_string());
-        assert!(!card_ids_match(&source, &None));
+        assert!(!card_ids_match(Some("aabbccdd"), None));
     }
 
     #[test]
     fn test_card_ids_match_both_none() {
-        assert!(!card_ids_match(&None, &None));
+        assert!(!card_ids_match(None, None));
     }
 
     #[test]

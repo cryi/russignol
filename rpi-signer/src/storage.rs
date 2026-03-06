@@ -49,14 +49,11 @@ use crate::util::run_command;
 /// Extended partition layout with hardware-specific fields.
 ///
 /// Wraps the shared [`russignol_storage::PartitionLayout`] with additional
-/// fields needed for first-boot setup (alignment, trim, disk size).
+/// fields needed for first-boot setup (disk size).
 #[derive(Debug)]
-#[allow(dead_code)] // Fields used for Debug output and diagnostic logging
 pub struct PartitionLayout {
     pub partitions: russignol_storage::PartitionLayout,
-    pub alignment: u64,
     pub disk_size_sectors: u64,
-    pub trim_supported: bool,
 }
 
 // BLKPG structures - must match kernel's blkpg.h
@@ -92,7 +89,7 @@ where
     );
 
     progress("Planning partitions...", 10)?;
-    let layout = calculate_partition_layout(alignment, trim_supported)?;
+    let layout = calculate_partition_layout(alignment)?;
     log::info!("Partition layout: {layout:?}");
 
     progress("Creating partitions...", 20)?;
@@ -175,10 +172,7 @@ fn read_sysfs_u64(path: &str) -> Result<u64, String> {
 }
 
 /// Calculate partition layout based on hardware parameters
-fn calculate_partition_layout(
-    alignment: u64,
-    trim_supported: bool,
-) -> Result<PartitionLayout, String> {
+fn calculate_partition_layout(alignment: u64) -> Result<PartitionLayout, String> {
     // Get disk size from sysfs
     let disk_size_sectors = read_sysfs_u64("/sys/block/mmcblk0/size")?;
     let disk_size_bytes = disk_size_sectors * SECTOR_SIZE;
@@ -205,9 +199,7 @@ fn calculate_partition_layout(
 
     Ok(PartitionLayout {
         partitions,
-        alignment,
         disk_size_sectors,
-        trim_supported,
     })
 }
 

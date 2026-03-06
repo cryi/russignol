@@ -721,8 +721,8 @@ pub fn create_changelog_file_for_component(
     };
 
     let full_messages = get_full_commit_messages(tag.as_deref(), &end_ref).unwrap_or_default();
-    let changelog =
-        generate_with_claude(version, &date, tag.as_deref(), &full_messages).unwrap_or_else(|e| {
+    let changelog = generate_with_claude(version, &date, tag.as_deref(), &full_messages)
+        .unwrap_or_else(|e| {
             eprintln!("  Note: Claude generation skipped ({e}), using raw commit messages");
             generate_changelog(version, &date, tag.as_deref(), &commits)
         });

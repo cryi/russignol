@@ -69,15 +69,25 @@ enum ReleaseComponent {
     All,
 }
 
+/// Publish target flags shared between release and publish commands
+#[derive(clap::Args)]
+struct PublishTargets {
+    /// Create GitHub release with binaries (requires gh CLI)
+    #[arg(long)]
+    github: bool,
+
+    /// Publish website to Cloudflare Pages (requires wrangler CLI)
+    #[arg(long)]
+    website: bool,
+}
+
 /// Options for the release command
-#[allow(clippy::struct_excessive_bools)]
 struct ReleaseOptions {
     channel: ReleaseChannel,
     component: ReleaseComponent,
     no_bump: bool,
     clean: bool,
-    github: bool,
-    website: bool,
+    publish: PublishTargets,
 }
 
 impl ReleaseComponent {
@@ -199,13 +209,8 @@ enum Commands {
         #[arg(long)]
         clean: bool,
 
-        /// Create GitHub release with binaries (requires gh CLI)
-        #[arg(long)]
-        github: bool,
-
-        /// Publish website to Cloudflare Pages (requires wrangler CLI)
-        #[arg(long)]
-        website: bool,
+        #[command(flatten)]
+        publish: PublishTargets,
     },
 
     /// Run test suites across workspace
@@ -235,13 +240,8 @@ enum Commands {
         #[arg(short, long, default_value = "all")]
         component: ReleaseComponent,
 
-        /// Publish to GitHub releases (requires gh CLI)
-        #[arg(long)]
-        github: bool,
-
-        /// Publish website to Cloudflare Pages (requires wrangler CLI)
-        #[arg(long)]
-        website: bool,
+        #[command(flatten)]
+        publish: PublishTargets,
     },
 
     /// Run watermark protection E2E tests on a physical device
@@ -383,24 +383,18 @@ fn try_main() -> Result<()> {
             component,
             no_bump,
             clean,
-            github,
-            website,
+            publish,
         } => cmd_release(&ReleaseOptions {
             channel,
             component,
             no_bump,
             clean,
-            github,
-            website,
+            publish,
         }),
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
-        Commands::Publish {
-            component,
-            github,
-            website,
-        } => cmd_publish(component, github, website),
+        Commands::Publish { component, publish } => cmd_publish(component, &publish),
         Commands::WatermarkTest {
             device,
             port,
@@ -662,16 +656,16 @@ fn copy_release_assets() -> Result<Vec<String>> {
     Ok(assets)
 }
 
-fn cmd_publish(component: ReleaseComponent, github: bool, website: bool) -> Result<()> {
-    if !github && !website {
+fn cmd_publish(component: ReleaseComponent, publish: &PublishTargets) -> Result<()> {
+    if !publish.github && !publish.website {
         bail!("Specify --github and/or --website to publish");
     }
 
-    if github {
+    if publish.github {
         cmd_github_release(component)?;
     }
 
-    if website {
+    if publish.website {
         if component == ReleaseComponent::All {
             cmd_website_publish()?;
         } else {
@@ -807,9 +801,9 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
         component,
         no_bump,
         clean,
-        github,
-        website,
-    } = *opts;
+        publish,
+    } = opts;
+    let (channel, component, no_bump, clean) = (*channel, *component, *no_bump, *clean);
 
     if channel == ReleaseChannel::Beta && no_bump {
         bail!("Cannot use --no-bump with beta channel");
@@ -836,7 +830,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     println!("{}", format!("Building {release_desc}...").cyan().bold());
 
     // Website publishing only makes sense for full releases
-    if website && component != ReleaseComponent::All {
+    if publish.website && component != ReleaseComponent::All {
         println!(
             "  {} --website is only supported for full releases, ignoring",
             "⚠".yellow()
@@ -844,7 +838,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     }
 
     // Validate wrangler early if --website is used for full release
-    if website && component == ReleaseComponent::All {
+    if publish.website && component == ReleaseComponent::All {
         check_command("wrangler", "Install with: bun add -g wrangler")?;
     }
 
@@ -865,7 +859,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     step = build_component_artifacts(component, step)?;
 
     // Create GitHub release (optional)
-    if github {
+    if publish.github {
         println!(
             "\n{}",
             format!("Step {step}: Create GitHub Release").cyan().bold()
@@ -875,7 +869,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     }
 
     // Publish website (optional, only for full releases)
-    if website && component == ReleaseComponent::All {
+    if publish.website && component == ReleaseComponent::All {
         println!(
             "\n{}",
             format!("Step {step}: Publish Website").cyan().bold()
@@ -884,7 +878,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
     }
 
     // Print completion summary
-    print_release_summary(component, &version, github, website);
+    print_release_summary(component, &version, publish);
 
     Ok(())
 }
@@ -1292,7 +1286,7 @@ fn generate_checksums(assets: &[String]) -> Result<()> {
 }
 
 /// Print release completion summary
-fn print_release_summary(component: ReleaseComponent, version: &str, github: bool, website: bool) {
+fn print_release_summary(component: ReleaseComponent, version: &str, publish: &PublishTargets) {
     println!(
         "\n{} {}",
         "✓ Release".green().bold(),
@@ -1318,12 +1312,12 @@ fn print_release_summary(component: ReleaseComponent, version: &str, github: boo
         }
     }
 
-    if github {
+    if publish.github {
         let tag = component.format_tag(version);
         println!("  - GitHub: https://github.com/RichAyotte/russignol/releases/tag/{tag}");
     }
 
-    if website && component == ReleaseComponent::All {
+    if publish.website && component == ReleaseComponent::All {
         println!("  - Website: https://russignol.com");
     }
 }
