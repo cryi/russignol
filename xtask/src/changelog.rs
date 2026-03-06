@@ -106,7 +106,7 @@ impl CommitType {
 }
 
 /// Scopes excluded from release changelogs (not part of the shipped product)
-const EXCLUDED_SCOPES: &[&str] = &["website"];
+const EXCLUDED_SCOPES: &[&str] = &["website", "xtask"];
 
 /// A parsed conventional commit
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,8 +676,8 @@ fn generate_with_claude(
          benefits (reliability, power efficiency, temperature, performance, security, \
          usability) instead of implementation details. Be concise — each description \
          should be a single short sentence.\n\n\
-         Skip commits with type docs, refactor, test, style, ci, or scope website. \
-         Skip release meta-commits (chore(release), chore(xtask)).\n\n\
+         Skip commits with type docs, refactor, test, style, ci, or scope website or xtask. \
+         Skip release meta-commits (chore(release)).\n\n\
          When a fix commit is a follow-up correction to a new feature introduced in the \
          same release, fold its details into the parent feature's description instead of \
          listing it as a separate fix. Only list a commit under Fixed if it fixes a bug \
