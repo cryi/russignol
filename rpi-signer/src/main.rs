@@ -4,6 +4,7 @@ mod constants;
 mod cpu_freq;
 mod events;
 mod fonts;
+mod led;
 mod network_status;
 mod pages;
 mod setup;
@@ -117,7 +118,9 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let tx_for_signer = app_tx.clone();
 
     let cpu_boost = init_cpu_freq_control();
-    let (pre_sign_callback, post_sign_callback) = cpu_boost_callbacks(cpu_boost.as_ref());
+    let led = init_led_control();
+    let (pre_sign_callback, post_sign_callback) =
+        connection_callbacks(cpu_boost.as_ref(), led.as_ref());
 
     let signer_handle = std::thread::spawn(move || {
         // Wait for decrypted secret keys (passed in memory, never written to disk)
@@ -917,20 +920,53 @@ fn init_cpu_freq_control() -> Option<cpu_freq::CpuBoost> {
     }
 }
 
+/// Initialize LED control.
+///
+/// Returns `Some(Led)` if the sysfs brightness file is writable, `None` otherwise.
+fn init_led_control() -> Option<led::Led> {
+    match led::Led::new() {
+        Ok(led) => Some(led),
+        Err(e) => {
+            log::warn!("LED control unavailable: {e}");
+            None
+        }
+    }
+}
+
 type Callback = Option<Arc<dyn Fn() + Send + Sync>>;
 
-/// Create pre/post sign callbacks that bracket signing with CPU frequency boost/restore.
-fn cpu_boost_callbacks(cpu_boost: Option<&cpu_freq::CpuBoost>) -> (Callback, Callback) {
-    match cpu_boost {
-        Some(b) => {
-            let b1 = b.clone();
-            let b2 = b.clone();
+/// Create pre/post connection callbacks that bracket a signer connection with
+/// LED on/off and CPU frequency boost/restore.
+fn connection_callbacks(
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
+    led: Option<&led::Led>,
+) -> (Callback, Callback) {
+    match (cpu_boost, led) {
+        (None, None) => (None, None),
+        (cpu, led) => {
+            let cpu_pre = cpu.cloned();
+            let cpu_post = cpu.cloned();
+            let led_pre = led.cloned();
+            let led_post = led.cloned();
             (
-                Some(Arc::new(move || b1.boost())),
-                Some(Arc::new(move || b2.restore())),
+                Some(Arc::new(move || {
+                    if let Some(ref l) = led_pre {
+                        l.on();
+                    }
+                    if let Some(ref b) = cpu_pre {
+                        b.boost();
+                    }
+                })),
+                Some(Arc::new(move || {
+                    if let Some(ref b) = cpu_post {
+                        b.restore();
+                    }
+                    if let Some(ref l) = led_post {
+                        l.off();
+                    }
+                })),
             )
         }
-        None => (None, None),
     }
 }
 

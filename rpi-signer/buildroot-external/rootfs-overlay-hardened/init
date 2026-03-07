@@ -338,6 +338,7 @@ run_supervisor() {
     # After setup: run as unprivileged russignol user via su with logging
     # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
     chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+    chown russignol /sys/class/leds/ACT/brightness 2>/dev/null
 
     if ! partition_exists 3 || ! partition_exists 4; then
         # First boot: run as root, no log redirection (would fail anyway)
@@ -378,7 +379,7 @@ init_mounts
 log_debug "After init_mounts"
 
 log_debug "Disabling activity LED"
-echo 0 > /sys/class/leds/led0/brightness 2>/dev/null
+echo 0 > /sys/class/leds/ACT/brightness 2>/dev/null
 
 log_debug "Before init_mdev"
 init_mdev

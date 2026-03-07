@@ -73,7 +73,7 @@ mount_data_partition() {
 case "$1" in
 start)
     # Disable activity LED (~1mA / 5mW saving)
-    echo 0 >/sys/class/leds/led0/brightness 2>/dev/null
+    echo 0 >/sys/class/leds/ACT/brightness 2>/dev/null
 
     echo "Starting Russignol"
 
@@ -86,6 +86,7 @@ start)
     # After setup: run as unprivileged russignol user
     # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
     chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+    chown russignol /sys/class/leds/ACT/brightness 2>/dev/null
 
     if ! partition_exists 3 || ! partition_exists 4; then
         echo "First boot detected - running as root for storage setup"
