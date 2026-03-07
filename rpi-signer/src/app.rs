@@ -3,11 +3,8 @@ use russignol_signer_lib::{ChainId, HighWatermark, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use embedded_graphics::prelude::Point;
-
 use crate::events::AppEvent;
 use crate::setup;
-use crate::tap_counter;
 
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -118,10 +115,8 @@ pub enum Effect {
         new_level: u32,
     },
     ResetActivity,
-    ResetTapCounter,
     SaveCurrentPage,
     RestoreSavedPage,
-    RestoreShutdownPage,
     FatalError {
         title: String,
         message: String,
@@ -140,8 +135,6 @@ pub struct App {
     pub watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     pub needs_animation: bool,
     pub animation_interval: Duration,
-    pub tap_counter: tap_counter::TapCounter,
-    pub pending_tap: Option<(Point, Instant)>,
 }
 
 impl App {
@@ -169,8 +162,6 @@ impl App {
             watermark,
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
-            tap_counter: tap_counter::TapCounter::new(5, Duration::from_millis(300)),
-            pending_tap: None,
         }
     }
 
@@ -185,20 +176,7 @@ impl App {
     }
 
     pub fn recv_timeout(&self) -> Duration {
-        if let Some((_, tap_time)) = self.pending_tap {
-            let elapsed = tap_time.elapsed();
-            if elapsed >= self.tap_counter.max_gap() {
-                Duration::ZERO
-            } else {
-                self.tap_counter
-                    .max_gap()
-                    .checked_sub(elapsed)
-                    .unwrap()
-                    .min(self.animation_interval)
-            }
-        } else {
-            self.animation_interval
-        }
+        self.animation_interval
     }
 
     pub fn set_screensaver(&mut self, active: bool) {
@@ -479,14 +457,6 @@ impl App {
                         Effect::ResetActivity,
                     ]);
                 }
-            }
-            AppEvent::CancelShutdown => {
-                log::info!("Shutdown cancelled, restoring previous page");
-                effects.extend([
-                    Effect::ResetTapCounter,
-                    Effect::RestoreShutdownPage,
-                    Effect::ResetActivity,
-                ]);
             }
             AppEvent::WatermarkError {
                 pkh,
@@ -947,20 +917,6 @@ mod tests {
             vec![
                 Effect::SendKeys("keys".into()),
                 Effect::ShowPage(PageSpec::Status),
-                Effect::ResetActivity,
-            ]
-        );
-    }
-
-    #[test]
-    fn cancel_shutdown_restores_page() {
-        let mut app = active_app();
-        let (_action, effects) = app.handle_event(AppEvent::CancelShutdown);
-        assert_eq!(
-            effects,
-            vec![
-                Effect::ResetTapCounter,
-                Effect::RestoreShutdownPage,
                 Effect::ResetActivity,
             ]
         );

@@ -10,7 +10,6 @@ mod pages;
 mod setup;
 mod signer_server;
 mod storage;
-mod tap_counter;
 mod tezos_encrypt;
 mod tezos_signer;
 mod util;
@@ -239,9 +238,8 @@ fn run_ui_loop(
     current_page.show(&mut device.display)?;
     device.display.update()?;
 
-    // Page save slots live in the runtime (not App) because they hold Box<dyn Page<Display>>
+    // Page save slot for screensaver restore
     let mut saved_page: Option<Box<dyn Page<Display>>> = None;
-    let mut shutdown_saved_page: Option<Box<dyn Page<Display>>> = None;
 
     loop {
         let timeout = app.recv_timeout();
@@ -267,14 +265,7 @@ fn run_ui_loop(
         // Handle Touch and DirtyDisplay directly in the runtime
         match event {
             AppEvent::Touch(touch_point) => {
-                handle_touch(
-                    &mut app,
-                    &mut device,
-                    &mut current_page,
-                    &mut saved_page,
-                    &mut shutdown_saved_page,
-                    touch_point,
-                )?;
+                handle_touch(&mut app, &mut current_page, touch_point);
                 continue;
             }
             AppEvent::DirtyDisplay => {
@@ -297,7 +288,6 @@ fn run_ui_loop(
                 &mut device,
                 &mut current_page,
                 &mut saved_page,
-                &mut shutdown_saved_page,
                 cpu_boost,
             )?;
             if action == LoopAction::Break {
@@ -316,16 +306,6 @@ fn handle_timeout(
     tx: &crossbeam_channel::Sender<AppEvent>,
     screensaver_timeout: Duration,
 ) -> epd_2in13_v4::EpdResult<()> {
-    // Fire debounced tap if its delay has expired
-    if let Some((point, tap_time)) = app.pending_tap
-        && tap_time.elapsed() >= app.tap_counter.max_gap()
-    {
-        app.pending_tap = None;
-        if current_page.handle_touch(point) {
-            app.tap_counter.reset();
-        }
-    }
-
     // Check for inactivity timeout (screensaver)
     if let AppState::Active {
         screensaver_active,
@@ -347,88 +327,15 @@ fn handle_timeout(
     Ok(())
 }
 
-fn handle_touch(
-    app: &mut App,
-    device: &mut Device,
-    current_page: &mut Box<dyn Page<Display>>,
-    saved_page: &mut Option<Box<dyn Page<Display>>>,
-    shutdown_saved_page: &mut Option<Box<dyn Page<Display>>>,
-    touch_point: Point,
-) -> epd_2in13_v4::EpdResult<()> {
-    let now = Instant::now();
-
+fn handle_touch(app: &mut App, current_page: &mut Box<dyn Page<Display>>, touch_point: Point) {
     if app.is_screensaver_active() {
-        // Screensaver: all taps count toward shutdown
-        if app.tap_counter.record_tap(now) {
-            log::info!("Tap-to-shutdown threshold reached, showing confirmation");
-            app.tap_counter.reset();
-            device.display_wake()?;
-            if let AppState::Active {
-                screensaver_active, ..
-            } = &mut app.state
-            {
-                *screensaver_active = false;
-            }
-            *shutdown_saved_page = saved_page.take();
-            *current_page = Box::new(confirmation::Page::new(
-                app.tx.clone(),
-                "Shutdown the device?",
-                AppEvent::Shutdown,
-                AppEvent::CancelShutdown,
-                false,
-                "Shutdown",
-            ));
-            app.current_page_modal = true;
-            app.needs_animation = false;
-            current_page.show(&mut device.display)?;
-            device.display.update()?;
-        } else {
-            log::debug!("Touch detected while screensaver active, waking up");
-            let _ = app.tx.send(AppEvent::DeactivateScreensaver);
-        }
-    } else if current_page.is_modal() {
-        // Modal pages: buttons must always work, no shutdown counter
+        let _ = app.tx.send(AppEvent::DeactivateScreensaver);
+    } else {
         current_page.handle_touch(touch_point);
         if let AppState::Active { last_activity, .. } = &mut app.state {
-            *last_activity = now;
-        }
-    } else {
-        // Non-modal pages: debounce to suppress page-swap during multi-tap
-        let is_followup = app.tap_counter.has_recent_taps(now);
-        let triggered = app.tap_counter.record_tap(now);
-
-        if triggered {
-            log::info!("Tap-to-shutdown threshold reached, showing confirmation");
-            app.tap_counter.reset();
-            app.pending_tap = None;
-            let old_page = std::mem::replace(
-                current_page,
-                Box::new(confirmation::Page::new(
-                    app.tx.clone(),
-                    "Shutdown the device?",
-                    AppEvent::Shutdown,
-                    AppEvent::CancelShutdown,
-                    false,
-                    "Shutdown",
-                )),
-            );
-            *shutdown_saved_page = Some(old_page);
-            app.current_page_modal = true;
-            app.needs_animation = false;
-            current_page.show(&mut device.display)?;
-            device.display.update()?;
-        } else if is_followup {
-            app.pending_tap = None;
-        } else {
-            app.pending_tap = Some((touch_point, now));
-        }
-
-        if let AppState::Active { last_activity, .. } = &mut app.state {
-            *last_activity = now;
+            *last_activity = Instant::now();
         }
     }
-
-    Ok(())
 }
 
 fn construct_page(
@@ -500,7 +407,6 @@ fn apply_effects(
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
     saved_page: &mut Option<Box<dyn Page<Display>>>,
-    shutdown_saved_page: &mut Option<Box<dyn Page<Display>>>,
     cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     for effect in effects {
@@ -578,7 +484,6 @@ fn apply_effects(
                     *last_activity = Instant::now();
                 }
             }
-            Effect::ResetTapCounter => app.tap_counter.reset(),
             Effect::SaveCurrentPage => {
                 *saved_page = Some(std::mem::replace(
                     current_page,
@@ -591,9 +496,6 @@ fn apply_effects(
                 }
                 current_page.show(&mut device.display)?;
                 device.display.update()?;
-            }
-            Effect::RestoreShutdownPage => {
-                apply_restore_shutdown(app, device, current_page, shutdown_saved_page)?;
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
             Effect::Exit(code) => std::process::exit(code),
@@ -774,27 +676,6 @@ fn apply_verify_storage(device: &mut Device) {
     if let Err(e) = setup::create_directories() {
         fatal_error(device, "SETUP FAILED", &e);
     }
-}
-
-fn apply_restore_shutdown(
-    app: &mut App,
-    device: &mut Device,
-    current_page: &mut Box<dyn Page<Display>>,
-    shutdown_saved_page: &mut Option<Box<dyn Page<Display>>>,
-) -> epd_2in13_v4::EpdResult<()> {
-    if let Some(page) = shutdown_saved_page.take() {
-        *current_page = page;
-    } else {
-        *current_page = Box::new(status::Page::new(
-            app.tx.clone(),
-            app.signing_activity.clone(),
-        ));
-    }
-    app.needs_animation = false;
-    app.current_page_modal = current_page.is_modal();
-    current_page.show(&mut device.display)?;
-    device.display.update()?;
-    Ok(())
 }
 
 fn apply_watermark_update(
