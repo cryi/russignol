@@ -47,8 +47,10 @@ pub enum PageSpec {
     PinCreate,
     PinConfirm,
     PinVerify,
+    Menu,
     Status,
     Signatures,
+    Watermarks,
     Screensaver,
     Dialog {
         message: String,
@@ -428,10 +430,9 @@ impl App {
         let mut effects = Vec::new();
         match event {
             AppEvent::KeysDecrypted(secret_keys_json) => {
-                log::info!("KeysDecrypted event received, showing status page");
                 effects.extend([
                     Effect::SendKeys(secret_keys_json),
-                    Effect::ShowPage(PageSpec::Status),
+                    Effect::ShowPage(PageSpec::Menu),
                     Effect::ResetActivity,
                 ]);
             }
@@ -439,7 +440,6 @@ impl App {
                 if self.current_page_modal || self.is_screensaver_active() {
                     return (LoopAction::Continue, vec![]);
                 }
-                log::info!("Activating screensaver");
                 self.set_screensaver(true);
                 effects.extend([
                     Effect::SaveCurrentPage,
@@ -497,16 +497,26 @@ impl App {
                     new_level,
                 });
             }
-            AppEvent::WatermarkUpdateSuccess | AppEvent::DialogDismissed => {
+            AppEvent::WatermarkUpdateSuccess | AppEvent::DialogDismissed | AppEvent::ShowMenu => {
+                effects.push(Effect::ShowPage(PageSpec::Menu));
+            }
+            AppEvent::RequestShutdown => {
+                effects.push(Effect::ShowPage(PageSpec::Confirmation {
+                    message: "Shutdown the device?".into(),
+                    on_confirm: AppEvent::Shutdown,
+                    on_cancel: AppEvent::ShowMenu,
+                    warning: false,
+                    button_text: "Shutdown".into(),
+                }));
+            }
+            AppEvent::ShowStatus if !self.current_page_modal => {
+                effects.push(Effect::ShowPage(PageSpec::Status));
+            }
+            AppEvent::ShowSignatures if !self.current_page_modal => {
                 effects.push(Effect::ShowPage(PageSpec::Signatures));
             }
-            AppEvent::ShowStatus | AppEvent::ShowSignatures if !self.current_page_modal => {
-                let page = if matches!(event, AppEvent::ShowStatus) {
-                    PageSpec::Status
-                } else {
-                    PageSpec::Signatures
-                };
-                effects.push(Effect::ShowPage(page));
+            AppEvent::ShowWatermarks if !self.current_page_modal => {
+                effects.push(Effect::ShowPage(PageSpec::Watermarks));
             }
             _ => {}
         }
@@ -909,14 +919,14 @@ mod tests {
     }
 
     #[test]
-    fn keys_decrypted_sends_keys_and_shows_status() {
+    fn keys_decrypted_sends_keys_and_shows_menu() {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::KeysDecrypted("keys".into()));
         assert_eq!(
             effects,
             vec![
                 Effect::SendKeys("keys".into()),
-                Effect::ShowPage(PageSpec::Status),
+                Effect::ShowPage(PageSpec::Menu),
                 Effect::ResetActivity,
             ]
         );
@@ -987,10 +997,10 @@ mod tests {
     }
 
     #[test]
-    fn dialog_dismissed_shows_signatures() {
+    fn dialog_dismissed_shows_menu() {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::DialogDismissed);
-        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Signatures)]);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Menu)]);
     }
 
     #[test]
@@ -1008,5 +1018,35 @@ mod tests {
                 message: "something broke".into(),
             }]
         );
+    }
+
+    #[test]
+    fn show_menu_navigates_to_menu() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowMenu);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Menu)]);
+    }
+
+    #[test]
+    fn show_watermarks_navigates_to_watermarks() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowWatermarks);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Watermarks)]);
+    }
+
+    #[test]
+    fn request_shutdown_shows_confirmation() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::RequestShutdown);
+        assert!(has_show_page(
+            &effects,
+            &PageSpec::Confirmation {
+                message: "Shutdown the device?".into(),
+                on_confirm: AppEvent::Shutdown,
+                on_cancel: AppEvent::ShowMenu,
+                warning: false,
+                button_text: "Shutdown".into(),
+            }
+        ));
     }
 }

@@ -120,7 +120,7 @@ const COL_TIME_X: i32 = 228;
 impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, _point: Point) -> bool {
         // Any touch shows the status page
-        let _ = self.app_sender.send(AppEvent::ShowStatus);
+        let _ = self.app_sender.send(AppEvent::ShowMenu);
         false // Whole-page listener, not a specific button
     }
 

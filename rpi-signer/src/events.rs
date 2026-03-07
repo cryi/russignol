@@ -50,9 +50,12 @@ pub enum AppEvent {
         chain_id: ChainId,
         new_level: u32,
     }, // User confirmed updating watermark to new level
-    DialogDismissed,       // User cancelled a dialog, return to home
+    DialogDismissed,       // User cancelled a dialog, return to menu
+    ShowMenu,              // Show menu page
     ShowStatus,            // Show status page
-    ShowSignatures,        // Show signatures page
+    ShowSignatures,        // Show signatures/activity page
+    ShowWatermarks,        // Show watermarks page
+    RequestShutdown,       // Show shutdown confirmation from menu
     FatalError {
         title: String,
         message: String,

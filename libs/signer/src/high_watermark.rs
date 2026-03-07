@@ -101,6 +101,9 @@ struct PerKeyWatermark {
     /// A ceiling `(level, u32::MAX)` on disk means any crash recovery loads this value,
     /// allowing fdatasync to be skipped for updates covered by the ceiling.
     disk_ceiling: [Option<WatermarkEntry>; 3],
+    /// Last value confirmed on stable storage (after fdatasync), indexed by `OperationType as usize`.
+    /// Initialized from disk at load time; updated after each successful `write_watermark`.
+    disk_entries: [Option<WatermarkEntry>; 3],
 }
 
 /// Info needed to persist a watermark update to disk.
@@ -400,6 +403,7 @@ impl HighWatermark {
             per_key.files[idx].write_all_at(&buf, 0)?;
             per_key.files[idx].sync_data()?;
             per_key.disk_ceiling[idx] = None;
+            per_key.disk_entries[idx] = Some(prev);
         }
         Ok(())
     }
@@ -434,8 +438,12 @@ impl HighWatermark {
 
         // fdatasync — flushes data to stable storage (skips metadata since size is constant)
         per_key.files[idx].sync_data()?;
-        // Actual value is now on stable storage; clear stale ceiling
+        // Actual value is now on stable storage; update tracking
         per_key.disk_ceiling[idx] = None;
+        per_key.disk_entries[idx] = Some(WatermarkEntry {
+            level: update.level,
+            round: update.round,
+        });
 
         // Read-back verification in debug/test builds only
         #[cfg(debug_assertions)]
@@ -491,23 +499,49 @@ impl HighWatermark {
         let buf = encode_entry(ceiling_level, u32::MAX);
         per_key.files[idx].write_all_at(&buf, 0)?;
         per_key.files[idx].sync_data()?;
-        per_key.disk_ceiling[idx] = Some(WatermarkEntry {
+        let ceiling_entry = WatermarkEntry {
             level: ceiling_level,
             round: u32::MAX,
-        });
+        };
+        per_key.disk_ceiling[idx] = Some(ceiling_entry);
+        per_key.disk_entries[idx] = Some(ceiling_entry);
 
         Ok(())
     }
 
-    /// Get the current watermark level for a key.
+    /// Get the current in-memory watermark level for a key.
     ///
     /// Returns the highest level from any of the three operation types.
     /// Returns None if no watermark exists.
     #[must_use]
     pub fn get_current_level(&self, _chain_id: ChainId, pkh: &PublicKeyHash) -> Option<u32> {
+        self.get_max_level(pkh)
+    }
+
+    /// Get the current in-memory watermark level for a key (without chain context).
+    ///
+    /// Returns the highest level from any of the three operation types.
+    /// Returns None if no watermark exists.
+    #[must_use]
+    pub fn get_max_level(&self, pkh: &PublicKeyHash) -> Option<u32> {
         self.keys
             .get(pkh)?
             .entries
+            .iter()
+            .filter_map(|e| e.map(|w| w.level))
+            .max()
+    }
+
+    /// Get the persisted (on-disk) watermark level for a key.
+    ///
+    /// Returns the highest level from any of the three operation types
+    /// that has been confirmed on stable storage via fdatasync.
+    /// Returns None if no watermark has been persisted.
+    #[must_use]
+    pub fn get_persisted_level(&self, pkh: &PublicKeyHash) -> Option<u32> {
+        self.keys
+            .get(pkh)?
+            .disk_entries
             .iter()
             .filter_map(|e| e.map(|w| w.level))
             .max()
@@ -667,6 +701,7 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
             prev_files_opt[1].take().unwrap(),
             prev_files_opt[2].take().unwrap(),
         ],
+        disk_entries: entries,
         entries,
         disk_ceiling: [None; 3],
     })
@@ -1530,5 +1565,33 @@ mod tests {
                 round: 0
             })
         );
+    }
+
+    #[test]
+    fn get_persisted_level_tracks_disk_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // After load, persisted level matches in-memory level
+        assert_eq!(hwm.get_persisted_level(&pkh), Some(99));
+        assert_eq!(hwm.get_current_level(chain_id, &pkh), Some(99));
+
+        // Advance in-memory (check_and_update) but don't write to disk yet
+        let data = create_attestation_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hwm.get_current_level(chain_id, &pkh), Some(100));
+        assert_eq!(hwm.get_persisted_level(&pkh), Some(99)); // not yet written
+
+        // Write to disk
+        hwm.write_watermark(&update).unwrap();
+        assert_eq!(hwm.get_persisted_level(&pkh), Some(100)); // now matches
     }
 }

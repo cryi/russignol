@@ -32,7 +32,9 @@ use embedded_graphics::prelude::{DrawTarget, Point};
 use epd_2in13_v4::display::Display;
 use epd_2in13_v4::{Device, device};
 use events::AppEvent;
-use pages::{Page, confirmation, dialog, greeting, pin, screensaver, signatures, status};
+use pages::{
+    Page, confirmation, dialog, greeting, menu, pin, screensaver, signatures, status, watermarks,
+};
 use russignol_ui::pages::{error, progress};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -342,6 +344,7 @@ fn construct_page(
     spec: PageSpec,
     tx: &Sender<AppEvent>,
     signing_activity: &Arc<Mutex<signing_activity::SigningActivity>>,
+    watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
 ) -> Box<dyn Page<Display>> {
     match spec {
         PageSpec::PinCreate => Box::new(pin::Page::new(
@@ -357,10 +360,12 @@ fn construct_page(
         PageSpec::PinVerify => {
             Box::new(pin::Page::new(tx.clone(), "Enter\nPIN", pin::Mode::Verify))
         }
+        PageSpec::Menu => Box::new(menu::Page::new(tx.clone())),
         PageSpec::Status => Box::new(status::Page::new(tx.clone(), signing_activity.clone())),
         PageSpec::Signatures => {
             Box::new(signatures::Page::new(tx.clone(), signing_activity.clone()))
         }
+        PageSpec::Watermarks => Box::new(watermarks::Page::new(tx.clone(), watermark.clone())),
         PageSpec::Screensaver => Box::new(screensaver::Page::new()),
         PageSpec::Dialog {
             message,
@@ -525,7 +530,7 @@ fn apply_show_page(
         );
         device.display.update()?;
     } else {
-        let page = construct_page(spec, &app.tx, &app.signing_activity);
+        let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
         app.current_page_modal = page.is_modal();
         app.needs_animation = false;
         *current_page = page;

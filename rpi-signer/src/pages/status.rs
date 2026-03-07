@@ -123,7 +123,7 @@ impl Page {
 
 // Layout constants for 250x122 display
 const MARGIN: i32 = 3;
-const DISPLAY_WIDTH: i32 = 250;
+use super::DISPLAY_WIDTH;
 const ROW_1: i32 = 18;
 const LINE_Y: i32 = 28;
 const CONTENT_ROW_1: i32 = 45;
@@ -134,7 +134,7 @@ const ICON_GAP: i32 = 8;
 
 impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, _point: Point) -> bool {
-        let _ = self.app_sender.send(AppEvent::ShowSignatures);
+        let _ = self.app_sender.send(AppEvent::ShowMenu);
         false // Whole-page listener, not a specific button
     }
 

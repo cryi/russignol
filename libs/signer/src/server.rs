@@ -550,12 +550,22 @@ impl RequestHandler {
                     let watermark_arc = Arc::clone(watermark);
                     let ceil_pkh = update.pkh();
                     let ceil_idx = update.idx();
+                    let notify = self.signing_notify_callback.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(1));
-                        if let Ok(mut wm) = watermark_arc.write()
-                            && let Err(e) = wm.write_ceiling(ceil_pkh, ceil_idx, ceil_level)
-                        {
-                            log::warn!("Failed to write ceiling watermark: {e}");
+                        let ok = if let Ok(mut wm) = watermark_arc.write() {
+                            match wm.write_ceiling(ceil_pkh, ceil_idx, ceil_level) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    log::warn!("Failed to write ceiling watermark: {e}");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if ok && let Some(ref cb) = notify {
+                            cb();
                         }
                     });
                 }
