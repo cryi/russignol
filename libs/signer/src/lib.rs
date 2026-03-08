@@ -60,7 +60,7 @@ pub use bls::{PublicKey, PublicKeyHash, SecretKey, Signature};
 pub use high_watermark::{ChainId, HighWatermark, WatermarkError};
 pub use magic_bytes::{MagicByte, MagicByteError};
 pub use protocol::{SignerRequest, SignerResponse};
-pub use server::{KeyManager as ServerKeyManager, RequestHandler};
+pub use server::{KEY_ROLES, KeyManager as ServerKeyManager, RequestHandler};
 pub use signer::SignatureVersion;
 pub use signing_activity::{
     KeyType, OperationType, SignatureActivity, SigningActivity, SigningEvent, SigningEventRing,

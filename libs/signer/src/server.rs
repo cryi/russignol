@@ -137,6 +137,12 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
     }
 }
 
+/// Canonical key role ordering: consensus first, then companion.
+///
+/// The host utility expects `list_keys()[0]` = consensus, `[1]` = companion.
+/// All code that returns keys by role must use this ordering.
+pub const KEY_ROLES: &[&str] = &["consensus", "companion"];
+
 /// Key manager for storing and retrieving signers
 pub struct KeyManager {
     /// Map of public key hash to signer
@@ -178,10 +184,29 @@ impl KeyManager {
         self.key_names.get(pkh).map(String::as_str)
     }
 
-    /// List all known public key hashes
+    /// List all known public key hashes in deterministic order: consensus first, then companion.
+    ///
+    /// The host utility expects `[0]` = consensus and `[1]` = companion.
     #[must_use]
     pub fn list_keys(&self) -> Vec<PublicKeyHash> {
-        self.signers.keys().copied().collect()
+        let name_to_pkh: HashMap<&str, PublicKeyHash> = self
+            .key_names
+            .iter()
+            .map(|(pkh, name)| (name.as_str(), *pkh))
+            .collect();
+
+        let mut keys = Vec::new();
+        for name in KEY_ROLES {
+            if let Some(pkh) = name_to_pkh.get(name) {
+                keys.push(*pkh);
+            }
+        }
+        for pkh in self.signers.keys() {
+            if !keys.contains(pkh) {
+                keys.push(*pkh);
+            }
+        }
+        keys
     }
 }
 
@@ -1131,15 +1156,16 @@ mod tests {
     fn test_request_handler_known_keys() {
         let seed1 = [1u8; 32];
         let seed2 = [2u8; 32];
-        let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
-        let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
+        let (consensus_pkh, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
+        let (companion_pkh, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
 
         let signer1 = Unencrypted::generate(Some(&seed1)).unwrap();
         let signer2 = Unencrypted::generate(Some(&seed2)).unwrap();
 
         let mut mgr = KeyManager::new();
-        mgr.add_signer(pkh1, signer1, "key1".to_string());
-        mgr.add_signer(pkh2, signer2, "key2".to_string());
+        // Insert companion first to prove ordering is by role, not insertion order
+        mgr.add_signer(companion_pkh, signer2, "companion".to_string());
+        mgr.add_signer(consensus_pkh, signer1, "consensus".to_string());
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1154,8 +1180,8 @@ mod tests {
         match response {
             SignerResponse::KnownKeys(keys) => {
                 assert_eq!(keys.len(), 2);
-                assert!(keys.contains(&pkh1));
-                assert!(keys.contains(&pkh2));
+                assert_eq!(keys[0], consensus_pkh);
+                assert_eq!(keys[1], companion_pkh);
             }
             _ => panic!("Expected KnownKeys response"),
         }

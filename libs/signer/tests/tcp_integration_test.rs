@@ -62,15 +62,16 @@ fn test_tcp_server_known_keys() {
     // Setup with multiple keys
     let seed1 = [1u8; 32];
     let seed2 = [2u8; 32];
-    let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
-    let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
+    let (consensus_pkh, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
+    let (companion_pkh, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
 
     let signer1 = signer::Unencrypted::generate(Some(&seed1)).unwrap();
     let signer2 = signer::Unencrypted::generate(Some(&seed2)).unwrap();
 
     let mut key_mgr = ServerKeyManager::new();
-    key_mgr.add_signer(pkh1, signer1, "key1".to_string());
-    key_mgr.add_signer(pkh2, signer2, "key2".to_string());
+    // Insert companion first to prove ordering is by role, not insertion order
+    key_mgr.add_signer(companion_pkh, signer2, "companion".to_string());
+    key_mgr.add_signer(consensus_pkh, signer1, "consensus".to_string());
 
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),
@@ -96,8 +97,8 @@ fn test_tcp_server_known_keys() {
     match response {
         SignerResponse::KnownKeys(keys) => {
             assert_eq!(keys.len(), 2);
-            assert!(keys.contains(&pkh1));
-            assert!(keys.contains(&pkh2));
+            assert_eq!(keys[0], consensus_pkh);
+            assert_eq!(keys[1], companion_pkh);
         }
         r => panic!("Expected KnownKeys response, got {r:?}"),
     }

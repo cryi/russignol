@@ -4,6 +4,7 @@
 //! This module provides utilities for reading public keys.
 
 use crate::constants::KEYS_DIR;
+use russignol_signer_lib::KEY_ROLES;
 use russignol_signer_lib::wallet::{KeyManager as WalletKeyManager, StoredKey};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -15,11 +16,11 @@ pub struct TezosKey {
     pub value: String,
 }
 
-/// Order stored keys: consensus first, then companion.
+/// Order stored keys using the canonical role ordering from [`KEY_ROLES`].
 fn order_keys(stored_keys: &HashMap<String, StoredKey>) -> Vec<TezosKey> {
-    [stored_keys.get("consensus"), stored_keys.get("companion")]
-        .into_iter()
-        .flatten()
+    KEY_ROLES
+        .iter()
+        .filter_map(|role| stored_keys.get(*role))
         .map(|k| TezosKey {
             name: k.alias.clone(),
             value: k.public_key_hash.clone(),
