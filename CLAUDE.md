@@ -18,6 +18,8 @@ cargo xtask release           # Full release build (bumps version, builds, tags)
 cargo xtask release --github  # Release and publish to GitHub
 cargo xtask publish --github  # Publish existing build to GitHub (no rebuild)
 cargo xtask publish --website # Publish website to Cloudflare Pages
+cargo xtask deploy            # Build, deploy, and restart signer on device
+cargo xtask deploy --skip-build  # Deploy previously built binary
 cargo xtask validate          # Validate build environment
 cargo xtask clean             # Clean build artifacts
 cargo xtask config buildroot nconfig   # Configure buildroot (ncurses menu)

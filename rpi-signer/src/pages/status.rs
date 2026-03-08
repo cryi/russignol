@@ -1,12 +1,6 @@
-//! Status page showing system information
-//!
-//! Displays version, chain info, keys, and network status.
-
-use crate::chain_info;
 use crate::events::AppEvent;
 use crate::fonts;
 use crate::network_status::NetworkStatus;
-use crate::tezos_signer;
 
 use super::Page as PageTrait;
 use crossbeam_channel::Sender;
@@ -19,28 +13,15 @@ use embedded_graphics::{
 use russignol_signer_lib::signing_activity::SigningActivity;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use u8g2_fonts::FontRenderer;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Truncate a key hash for display
-/// Shows first 8 and last 6 characters: "tz4Abcde...123456"
-fn truncate_key(key: &str) -> String {
-    if key.len() <= 17 {
-        key.to_string()
-    } else {
-        format!("{}...{}", &key[..8], &key[key.len() - 6..])
-    }
-}
+use u8g2_fonts::{
+    FontRenderer,
+    types::{FontColor, HorizontalAlignment, VerticalPosition},
+};
 
 pub struct Page {
     app_sender: Sender<AppEvent>,
     network_status: Arc<Mutex<Option<NetworkStatus>>>,
-    // Cached values
-    chain_name: String,
-    chain_id: String,
-    consensus_pkh: Option<String>,
-    companion_pkh: Option<String>,
+    signing_activity: Arc<Mutex<SigningActivity>>,
 }
 
 impl Page {
@@ -48,36 +29,11 @@ impl Page {
         app_sender: Sender<AppEvent>,
         signing_activity: Arc<Mutex<SigningActivity>>,
     ) -> Self {
-        // Load keys once at construction
-        let keys = tezos_signer::get_keys();
-        let consensus_pkh = keys
-            .iter()
-            .find(|k| k.name.contains("consensus"))
-            .map(|k| k.value.clone());
-        let companion_pkh = keys
-            .iter()
-            .find(|k| k.name.contains("companion"))
-            .map(|k| k.value.clone());
-
-        // Load chain info (created during first boot)
-        let (chain_name, chain_id) = match chain_info::read_chain_info() {
-            Ok(info) => (info.name, info.id),
-            Err(e) => {
-                log::error!("Failed to read chain info: {e} - using defaults");
-                ("Unknown".to_string(), "Unknown".to_string())
-            }
-        };
-
-        // Seed with None so the first draw shows "Verifying" until the
-        // background thread completes its first check.
         let network_status: Arc<Mutex<Option<NetworkStatus>>> = Arc::new(Mutex::new(None));
 
-        // Spawn background thread to check network status periodically.
-        // The thread holds a Weak ref to network_status — when Page drops
-        // (page navigation, dialog overlay, etc.), the Weak fails to upgrade
-        // and the thread exits on its own.
         let ns_weak = Arc::downgrade(&network_status);
         let tx = app_sender.clone();
+        let signing_activity_bg = signing_activity.clone();
         std::thread::spawn(move || {
             let mut prev_status: Option<NetworkStatus> = None;
             loop {
@@ -85,7 +41,7 @@ impl Page {
                     return;
                 };
 
-                let last_sig_time = signing_activity.lock().ok().and_then(|activity| {
+                let last_sig_time = signing_activity_bg.lock().ok().and_then(|activity| {
                     let ct = activity.consensus.as_ref().map(|c| c.timestamp);
                     let cpt = activity.companion.as_ref().map(|c| c.timestamp);
                     match (ct, cpt) {
@@ -99,7 +55,6 @@ impl Page {
                 if let Ok(mut guard) = ns.lock() {
                     *guard = Some(status);
                 }
-                // Drop the strong ref before sleeping so Page can be dropped mid-sleep
                 drop(ns);
 
                 if prev_status.as_ref() != Some(&status) {
@@ -113,29 +68,50 @@ impl Page {
         Self {
             app_sender,
             network_status,
-            chain_name,
-            chain_id,
-            consensus_pkh,
-            companion_pkh,
+            signing_activity,
         }
     }
 }
 
 // Layout constants for 250x122 display
-const MARGIN: i32 = 3;
+const MARGIN: i32 = 6;
 use super::DISPLAY_WIDTH;
-const ROW_1: i32 = 18;
+const TITLE_Y: i32 = 18;
 const LINE_Y: i32 = 28;
-const CONTENT_ROW_1: i32 = 45;
-const CONTENT_ROW_2: i32 = 65;
-const CONTENT_ROW_3: i32 = 87;
-const CONTENT_ROW_4: i32 = 109;
-const ICON_GAP: i32 = 8;
+const ROW_1_Y: i32 = 48;
+const ROW_2_Y: i32 = 69;
+const ROW_3_Y: i32 = 90;
+const ROW_4_Y: i32 = 111;
+const VALUE_COL_X: i32 = 108;
+
+fn read_temperature() -> Option<f32> {
+    let raw = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp").ok()?;
+    let millideg: f32 = raw.trim().parse().ok()?;
+    Some(millideg / 1000.0)
+}
+
+fn read_uptime() -> Option<String> {
+    let raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    let field = raw.split_whitespace().next()?;
+    // /proc/uptime is "seconds.fractional ...", parse integer part
+    let secs: u64 = field.split('.').next()?.parse().ok()?;
+    let total_minutes = secs / 60;
+    let minutes = total_minutes % 60;
+    let hours = (total_minutes / 60) % 24;
+    let days = total_minutes / 60 / 24;
+    if days > 0 {
+        Some(format!("{days}d {hours}h {minutes}m"))
+    } else if hours > 0 {
+        Some(format!("{hours}h {minutes}m"))
+    } else {
+        Some(format!("{minutes}m"))
+    }
+}
 
 impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, _point: Point) -> bool {
         let _ = self.app_sender.send(AppEvent::ShowMenu);
-        false // Whole-page listener, not a specific button
+        false
     }
 
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
@@ -144,140 +120,81 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             .lock()
             .map_or_else(|e| *e.into_inner(), |guard| *guard);
 
-        draw_header(display, network_status.as_ref());
-        draw_separator(display)?;
-        draw_chain_info(display, &self.chain_name, &self.chain_id);
-        draw_key_row(display, self.consensus_pkh.as_ref(), "1", CONTENT_ROW_3);
-        draw_key_row(display, self.companion_pkh.as_ref(), "0", CONTENT_ROW_4);
+        // Title
+        let font = FontRenderer::new::<fonts::FONT_MEDIUM>();
+        font.render_aligned(
+            "System",
+            Point::new(DISPLAY_WIDTH / 2, TITLE_Y),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        )
+        .ok();
+
+        // Separator
+        Line::new(
+            Point::new(MARGIN, LINE_Y),
+            Point::new(DISPLAY_WIDTH - MARGIN, LINE_Y),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
+        .draw(display)?;
+
+        // Baker row
+        let status_str = match network_status.as_ref() {
+            None => "Checking...",
+            Some(s) if !s.interface_configured => "Offline",
+            Some(s) if !s.host_reachable => "Unreachable",
+            Some(s) if s.baker_active => "Active",
+            Some(_) => "Idle",
+        };
+        draw_label_value(display, "Baker", status_str, ROW_1_Y);
+
+        // Temperature row
+        let temp_str =
+            read_temperature().map_or_else(|| "N/A".into(), |t| format!("{t:.1}\u{00b0}C"));
+        draw_label_value(display, "CPU Temp", temp_str.as_str(), ROW_2_Y);
+
+        // Uptime row
+        let uptime_str = read_uptime().unwrap_or_else(|| "N/A".into());
+        draw_label_value(display, "Uptime", uptime_str.as_str(), ROW_3_Y);
+
+        // Signatures row
+        let sig_count = self
+            .signing_activity
+            .lock()
+            .map_or(0, |a| a.total_signatures);
+        let sig_str = format!("{sig_count} since boot");
+        draw_label_value(display, "Signatures", sig_str.as_str(), ROW_4_Y);
 
         Ok(())
     }
 }
 
-fn draw_header<D: DrawTarget<Color = BinaryColor>>(
+fn draw_label_value<D: DrawTarget<Color = BinaryColor>>(
     display: &mut D,
-    network_status: Option<&NetworkStatus>,
-) {
-    let font = FontRenderer::new::<fonts::FONT_MEDIUM>();
-
-    let version_str = format!("Russignol v{VERSION}");
-    font.render_aligned(
-        version_str.as_str(),
-        Point::new(MARGIN, ROW_1),
-        u8g2_fonts::types::VerticalPosition::Baseline,
-        u8g2_fonts::types::HorizontalAlignment::Left,
-        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-        display,
-    )
-    .ok();
-
-    let status_str = match network_status {
-        None => "Checking Host...",
-        Some(s) if !s.interface_configured => "Offline",
-        Some(s) if !s.host_reachable => "No Host",
-        Some(s) if s.baker_active => "Active",
-        Some(_) => "Ready",
-    };
-    font.render_aligned(
-        status_str,
-        Point::new(DISPLAY_WIDTH - MARGIN, ROW_1),
-        u8g2_fonts::types::VerticalPosition::Baseline,
-        u8g2_fonts::types::HorizontalAlignment::Right,
-        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-        display,
-    )
-    .ok();
-}
-
-fn draw_separator<D: DrawTarget<Color = BinaryColor>>(display: &mut D) -> Result<(), D::Error> {
-    Line::new(
-        Point::new(MARGIN, LINE_Y),
-        Point::new(DISPLAY_WIDTH - MARGIN, LINE_Y),
-    )
-    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
-    .draw(display)
-}
-
-fn draw_chain_info<D: DrawTarget<Color = BinaryColor>>(
-    display: &mut D,
-    chain_name: &str,
-    chain_id: &str,
+    label: &str,
+    value: &str,
+    y: i32,
 ) {
     let font = FontRenderer::new::<fonts::FONT_MEDIUM>();
 
     font.render_aligned(
-        chain_name,
-        Point::new(DISPLAY_WIDTH / 2, CONTENT_ROW_1),
-        u8g2_fonts::types::VerticalPosition::Center,
-        u8g2_fonts::types::HorizontalAlignment::Center,
-        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
+        label,
+        Point::new(MARGIN, y),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(BinaryColor::Off),
         display,
     )
     .ok();
 
     font.render_aligned(
-        chain_id,
-        Point::new(DISPLAY_WIDTH / 2, CONTENT_ROW_2),
-        u8g2_fonts::types::VerticalPosition::Center,
-        u8g2_fonts::types::HorizontalAlignment::Center,
-        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-        display,
-    )
-    .ok();
-}
-
-fn draw_key_row<D: DrawTarget<Color = BinaryColor>>(
-    display: &mut D,
-    pkh: Option<&String>,
-    icon_char: &str,
-    row_y: i32,
-) {
-    let font = FontRenderer::new::<fonts::FONT_MEDIUM>();
-    let icon_font = FontRenderer::new::<fonts::ICON_KEY>();
-
-    let key_display = pkh.map_or_else(|| "Not found".to_string(), |k| truncate_key(k));
-
-    let icon_width = icon_font
-        .get_rendered_dimensions(
-            icon_char,
-            Point::zero(),
-            u8g2_fonts::types::VerticalPosition::Center,
-        )
-        .ok()
-        .and_then(|d| d.bounding_box.map(|b| b.size.width.cast_signed()))
-        .unwrap_or(16);
-
-    let text_width = font
-        .get_rendered_dimensions(
-            key_display.as_str(),
-            Point::zero(),
-            u8g2_fonts::types::VerticalPosition::Center,
-        )
-        .ok()
-        .and_then(|d| d.bounding_box.map(|b| b.size.width.cast_signed()))
-        .unwrap_or(0);
-
-    let total_width = icon_width + ICON_GAP + text_width;
-    let icon_x = (DISPLAY_WIDTH - total_width) / 2;
-    let text_x = icon_x + icon_width + ICON_GAP;
-
-    icon_font
-        .render_aligned(
-            icon_char,
-            Point::new(icon_x, row_y),
-            u8g2_fonts::types::VerticalPosition::Center,
-            u8g2_fonts::types::HorizontalAlignment::Left,
-            u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-            display,
-        )
-        .ok();
-
-    font.render_aligned(
-        key_display.as_str(),
-        Point::new(text_x, row_y),
-        u8g2_fonts::types::VerticalPosition::Center,
-        u8g2_fonts::types::HorizontalAlignment::Left,
-        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
+        value,
+        Point::new(VALUE_COL_X, y),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(BinaryColor::Off),
         display,
     )
     .ok();

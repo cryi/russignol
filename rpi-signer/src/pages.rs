@@ -1,3 +1,5 @@
+pub mod about;
+pub mod blockchain;
 pub mod confirmation;
 pub mod dialog;
 pub mod greeting;

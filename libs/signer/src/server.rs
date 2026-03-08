@@ -613,6 +613,7 @@ impl RequestHandler {
                         key_type: crate::signing_activity::KeyType::Consensus,
                         activity: sig_activity,
                     });
+                activity.total_signatures += 1;
                 log::debug!(
                     "Updated consensus signing activity: level={:?}, duration={:?}ms",
                     level,
@@ -626,6 +627,7 @@ impl RequestHandler {
                         key_type: crate::signing_activity::KeyType::Companion,
                         activity: sig_activity,
                     });
+                activity.total_signatures += 1;
                 log::debug!(
                     "Updated companion signing activity: level={:?}, duration={:?}ms",
                     level,

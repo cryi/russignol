@@ -113,11 +113,15 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         let icon_margin = 10; // Margin around icon
         let text_margin = 5;
         let button_height = 40;
-        let bottom_margin = 5;
         let icon_size = 21; // Streamline icons are 21x21
+        let text_button_gap = 6;
+        // FONT_PROPORTIONAL (helvR12): ascent=12, bbox_height=20, TextBox line_height=21
+        // For TextBox rendering, use the font's actual line_height (21)
+        // For manual baseline rendering (key-value pairs), 16px between baselines is fine
+        let textbox_line_height = 21;
+        let manual_line_height = 16;
 
         // Split layout: narrow left column for icon, right side for text+buttons
-        // Left column width: margin + icon + margin (doubled margin)
         let left_column_width = if self.show_alert_icon {
             icon_margin + icon_size + icon_margin
         } else {
@@ -126,19 +130,27 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         let right_start = left_column_width;
         let right_width = display_width - right_start - text_margin;
 
-        // Position buttons fixed at the bottom of the right column
-        let button_top_y = display_height - button_height - bottom_margin;
+        // Calculate text block height based on content
+        let text_block_height = if let Some(ref pairs) = self.key_value_pairs {
+            // Title line + pair lines (manual baseline positioning)
+            (i32::try_from(pairs.len()).unwrap_or(0) + 1) * manual_line_height
+        } else {
+            // TextBox uses the font's actual line height
+            let line_count = i32::try_from(self.message.lines().count().max(1)).unwrap_or(1);
+            line_count * textbox_line_height
+        };
 
-        // === RIGHT COLUMN: Text area above buttons ===
-        let text_top = text_margin;
-        let text_button_gap = 5;
-        let text_height = button_top_y - text_top - text_button_gap;
+        // Center the entire block (text + gap + buttons) vertically
+        let block_height = text_block_height + text_button_gap + button_height;
+        let content_top = (display_height - block_height) / 2;
+        let button_top_y = content_top + block_height - button_height;
 
-        // === LEFT COLUMN: Icon (vertically centered with the 3-line text area) ===
+        let text_top = content_top;
+
+        // === LEFT COLUMN: Icon (vertically centered with the text area) ===
         if self.show_alert_icon {
             let icon_font = u8g2_fonts::FontRenderer::new::<fonts::ICON_WARNING>();
-            // Center icon vertically with the text area (not full display)
-            let text_center_y = text_top + text_height / 2;
+            let text_center_y = text_top + text_block_height / 2;
             let _ = icon_font.render_aligned(
                 '0',
                 Point::new(icon_margin + icon_size / 2, text_center_y),
@@ -149,21 +161,17 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             );
         }
 
+        // TextBox gets full space above buttons for VerticalAlignment::Middle centering
+        let textbox_height = button_top_y - text_button_gap;
         let text_bounds = Rectangle::new(
-            Point::new(right_start, text_top),
-            Size::new(right_width.cast_unsigned(), text_height.cast_unsigned()),
-        );
-        log::info!(
-            "[Page id={}] text_bounds={:?}, message_len={}",
-            self.id,
-            text_bounds,
-            self.message.len()
+            Point::new(right_start, 0),
+            Size::new(right_width.cast_unsigned(), textbox_height.cast_unsigned()),
         );
 
         if let Some(ref pairs) = self.key_value_pairs {
             // Render title centered and key-value pairs with aligned columns
             let font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
-            let line_height = 16; // Approximate height for Helvetica 12pt
+            let line_height = manual_line_height;
             let label_value_gap = 4; // Gap between label and value
 
             // Render title centered
@@ -222,7 +230,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                 );
             }
         } else {
-            // Draw message text with automatic word-wrapping (original behavior)
+            // Draw message text with word-wrapping, centered in text area
             let character_style = U8g2TextStyle::new(fonts::FONT_PROPORTIONAL, BinaryColor::Off);
             let textbox_style = TextBoxStyleBuilder::new()
                 .alignment(HorizontalAlignment::Center)

@@ -33,7 +33,8 @@ use epd_2in13_v4::display::Display;
 use epd_2in13_v4::{Device, device};
 use events::AppEvent;
 use pages::{
-    Page, confirmation, dialog, greeting, menu, pin, screensaver, signatures, status, watermarks,
+    Page, about, blockchain, confirmation, dialog, greeting, menu, pin, screensaver, signatures,
+    status, watermarks,
 };
 use russignol_ui::pages::{error, progress};
 use std::path::PathBuf;
@@ -366,6 +367,8 @@ fn construct_page(
             Box::new(signatures::Page::new(tx.clone(), signing_activity.clone()))
         }
         PageSpec::Watermarks => Box::new(watermarks::Page::new(tx.clone(), watermark.clone())),
+        PageSpec::Blockchain => Box::new(blockchain::Page::new(tx.clone())),
+        PageSpec::About => Box::new(about::Page::new(tx.clone())),
         PageSpec::Screensaver => Box::new(screensaver::Page::new()),
         PageSpec::Dialog {
             message,

@@ -12,6 +12,7 @@ mod build;
 mod changelog;
 mod clean;
 mod config;
+mod deploy;
 mod image;
 mod utils;
 mod watermark_test;
@@ -244,6 +245,13 @@ enum Commands {
         publish: PublishTargets,
     },
 
+    /// Build, deploy, and restart signer on connected device
+    Deploy {
+        /// Skip build step (deploy previously built binary)
+        #[arg(long)]
+        skip_build: bool,
+    },
+
     /// Run watermark protection E2E tests on a physical device
     WatermarkTest {
         /// Device IP address
@@ -395,6 +403,7 @@ fn try_main() -> Result<()> {
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
+        Commands::Deploy { skip_build } => deploy::deploy(skip_build),
         Commands::WatermarkTest {
             device,
             port,

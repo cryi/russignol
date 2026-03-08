@@ -51,6 +51,8 @@ pub enum PageSpec {
     Status,
     Signatures,
     Watermarks,
+    Blockchain,
+    About,
     Screensaver,
     Dialog {
         message: String,
@@ -517,6 +519,12 @@ impl App {
             }
             AppEvent::ShowWatermarks if !self.current_page_modal => {
                 effects.push(Effect::ShowPage(PageSpec::Watermarks));
+            }
+            AppEvent::ShowBlockchain if !self.current_page_modal => {
+                effects.push(Effect::ShowPage(PageSpec::Blockchain));
+            }
+            AppEvent::ShowAbout if !self.current_page_modal => {
+                effects.push(Effect::ShowPage(PageSpec::About));
             }
             _ => {}
         }
@@ -1032,6 +1040,36 @@ mod tests {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::ShowWatermarks);
         assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Watermarks)]);
+    }
+
+    #[test]
+    fn show_blockchain_navigates_to_blockchain() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowBlockchain);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Blockchain)]);
+    }
+
+    #[test]
+    fn show_blockchain_when_modal_produces_no_effects() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let (_action, effects) = app.handle_event(AppEvent::ShowBlockchain);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn show_about_navigates_to_about() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowAbout);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::About)]);
+    }
+
+    #[test]
+    fn show_about_when_modal_produces_no_effects() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let (_action, effects) = app.handle_event(AppEvent::ShowAbout);
+        assert!(effects.is_empty());
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub enum AppEvent {
     ShowStatus,            // Show status page
     ShowSignatures,        // Show signatures/activity page
     ShowWatermarks,        // Show watermarks page
+    ShowBlockchain,        // Show blockchain/chain info page
+    ShowAbout,             // Show about page
     RequestShutdown,       // Show shutdown confirmation from menu
     FatalError {
         title: String,

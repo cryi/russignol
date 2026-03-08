@@ -131,6 +131,8 @@ pub struct SigningActivity {
     pub chain_id: Option<[u8; 4]>,
     /// Recent signing events (ring buffer, newest last)
     pub recent_events: SigningEventRing,
+    /// Total number of signatures since boot
+    pub total_signatures: u64,
 }
 
 impl SigningActivity {
