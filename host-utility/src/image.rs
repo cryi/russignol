@@ -525,6 +525,7 @@ fn run_restore_flash(
     yes: bool,
     uncompressed_size: Option<u64>,
     metadata: &FlashMetadata,
+    min_watermark_level: Option<u32>,
 ) -> Result<()> {
     use crate::restore_keys;
 
@@ -541,6 +542,7 @@ fn run_restore_flash(
             yes,
             uncompressed_size,
             metadata,
+            min_watermark_level,
         );
     }
 
@@ -566,7 +568,15 @@ fn run_restore_flash(
     check_device_not_mounted(&target.path)?;
     check_device_has_media(&target.path)?;
 
-    restore_keys::run_dual_reader_restore(&target, image, yes, uncompressed_size, &backup, metadata)
+    restore_keys::run_dual_reader_restore(
+        &target,
+        image,
+        yes,
+        uncompressed_size,
+        &backup,
+        metadata,
+        min_watermark_level,
+    )
 }
 
 fn cmd_flash(
@@ -592,6 +602,9 @@ fn cmd_flash(
     utils::info("Computing image hash...");
     let image_sha256 = compute_file_sha256(image)?;
 
+    // Check node FIRST - fail fast if node is unavailable
+    let chain_info = check_node_for_watermarks(endpoint)?;
+
     // Restore-keys path
     if let Some(restore_keys_arg) = restore_keys {
         println!();
@@ -602,15 +615,20 @@ fn cmd_flash(
             image_version: None,
             channel: None,
         };
-        return run_restore_flash(&restore_source, image, device, yes, None, &metadata);
+        return run_restore_flash(
+            &restore_source,
+            image,
+            device,
+            yes,
+            None,
+            &metadata,
+            chain_info.as_ref().map(|info| info.level),
+        );
     }
 
     // Normal path
     println!();
     print_title_bar("💾 Flash SD Card");
-
-    // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks(endpoint)?;
 
     // Detect or use provided device
     let target_device = if let Some(dev) = device {
@@ -766,6 +784,9 @@ fn cmd_download_and_flash(
     {
         bail!("Device not found: {}", dev.display());
     }
+    // Check node FIRST - fail fast if node is unavailable
+    let chain_info = check_node_for_watermarks(endpoint)?;
+
     // Restore-keys path
     if let Some(restore_keys_arg) = restore_keys {
         println!();
@@ -802,15 +823,13 @@ fn cmd_download_and_flash(
             yes,
             dl.uncompressed_size,
             &metadata,
+            chain_info.as_ref().map(|info| info.level),
         );
     }
 
     // Normal path
     println!();
     print_title_bar("📥💾 Download and Flash SD Card");
-
-    // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks(endpoint)?;
 
     // Detect/select device
     let target_device = if let Some(dev) = device {

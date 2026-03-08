@@ -44,6 +44,20 @@ pub struct SourceBackup {
     pub source_card_id: Option<String>,
 }
 
+impl SourceBackup {
+    /// Return the maximum block watermark level across all keys.
+    pub fn max_watermark_level(&self) -> Option<u32> {
+        self.watermarks
+            .iter()
+            .filter_map(|pk| pk.block.as_deref())
+            .filter_map(|data| {
+                let buf: &[u8; watermark::FILE_SIZE] = data.try_into().ok()?;
+                watermark::decode(buf).map(|(level, _)| level)
+            })
+            .max()
+    }
+}
+
 /// Calculate restore partition layout from sfdisk JSON output.
 ///
 /// This is the testable core: takes parsed JSON plus the disk size (from sysfs)
@@ -390,7 +404,11 @@ pub fn create_and_format_partitions(device: &Path) -> Result<()> {
 }
 
 /// Write backup data to target device partitions
-pub fn write_backup_to_target(device: &Path, backup: &SourceBackup) -> Result<()> {
+pub fn write_backup_to_target(
+    device: &Path,
+    backup: &SourceBackup,
+    min_watermark_level: Option<u32>,
+) -> Result<()> {
     let p3_path = get_partition_path(device, 3);
     let p4_path = get_partition_path(device, 4);
 
@@ -433,17 +451,17 @@ pub fn write_backup_to_target(device: &Path, backup: &SourceBackup) -> Result<()
             let key_dir = watermarks_dir.join(&per_key.pkh);
             fs::create_dir_all(&key_dir)
                 .with_context(|| format!("Failed to create watermark dir for {}", per_key.pkh))?;
-            if let Some(ref data) = per_key.block {
-                fs::write(key_dir.join(watermark::FILENAMES[0]), data)
-                    .context("Failed to write block_watermark")?;
-            }
-            if let Some(ref data) = per_key.preattestation {
-                fs::write(key_dir.join(watermark::FILENAMES[1]), data)
-                    .context("Failed to write preattestation_watermark")?;
-            }
-            if let Some(ref data) = per_key.attestation {
-                fs::write(key_dir.join(watermark::FILENAMES[2]), data)
-                    .context("Failed to write attestation_watermark")?;
+            for (slot, filename) in [
+                (&per_key.block, watermark::FILENAMES[0]),
+                (&per_key.preattestation, watermark::FILENAMES[1]),
+                (&per_key.attestation, watermark::FILENAMES[2]),
+            ] {
+                if let Some(ref data) =
+                    watermark::effective_watermark(slot.as_deref(), min_watermark_level)
+                {
+                    fs::write(key_dir.join(filename), data)
+                        .with_context(|| format!("Failed to write {filename}"))?;
+                }
             }
         }
         Ok(())
@@ -504,12 +522,6 @@ fn parse_chain_info(chain_info: &[u8]) -> Option<(String, String)> {
     let name = json.get("name").and_then(|v| v.as_str())?.to_string();
     let id = json.get("id").and_then(|v| v.as_str())?.to_string();
     Some((name, id))
-}
-
-/// Extract the watermark level from a 40-byte binary watermark file.
-fn extract_watermark_level(data: &[u8]) -> Option<u32> {
-    let buf: &[u8; watermark::FILE_SIZE] = data.try_into().ok()?;
-    watermark::decode(buf).map(|(level, _)| level)
 }
 
 /// Map a key alias to a user-friendly label
@@ -577,12 +589,7 @@ pub fn confirm_restore_operation(
         lines.push(format!("Chain: {name} ({id})"));
     }
 
-    if let Some(level) = backup
-        .watermarks
-        .iter()
-        .filter_map(|pk| pk.block.as_deref())
-        .find_map(extract_watermark_level)
-    {
+    if let Some(level) = backup.max_watermark_level() {
         lines.push(format!(
             "Head Level: {}",
             utils::format_with_separators(level)
@@ -891,6 +898,7 @@ pub fn run_single_reader_restore(
     yes: bool,
     uncompressed_size: Option<u64>,
     metadata: &image::FlashMetadata,
+    min_watermark_level: Option<u32>,
 ) -> Result<()> {
     // Step 1: Read source card, prompting for swap if the inserted card isn't valid
     if !restore_from.exists() {
@@ -946,7 +954,7 @@ pub fn run_single_reader_restore(
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from)?;
-    write_backup_to_target(restore_from, &backup)?;
+    write_backup_to_target(restore_from, &backup, min_watermark_level)?;
 
     image::write_flash_manifest(restore_from, metadata)
         .context("Failed to write flash manifest")?;
@@ -963,6 +971,7 @@ pub fn run_dual_reader_restore(
     uncompressed_size: Option<u64>,
     backup: &SourceBackup,
     metadata: &image::FlashMetadata,
+    min_watermark_level: Option<u32>,
 ) -> Result<()> {
     // Confirm before flashing
     if !confirm_restore_operation(target, backup, yes)? {
@@ -977,7 +986,7 @@ pub fn run_dual_reader_restore(
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path)?;
-    write_backup_to_target(&target.path, backup)?;
+    write_backup_to_target(&target.path, backup, min_watermark_level)?;
 
     image::write_flash_manifest(&target.path, metadata)
         .context("Failed to write flash manifest")?;
@@ -1181,5 +1190,44 @@ mod tests {
             },
         ];
         assert!(!is_single_reader_mode(restore_from, None, &devices));
+    }
+
+    #[test]
+    fn test_max_watermark_level() {
+        let backup = SourceBackup {
+            secret_keys_enc: vec![],
+            public_keys: vec![],
+            public_key_hashs: vec![],
+            chain_info: vec![],
+            watermarks: vec![
+                PerKeyWatermarkBackup {
+                    pkh: "tz4key1".into(),
+                    block: Some(watermark::encode(100_000, 0).to_vec()),
+                    preattestation: None,
+                    attestation: None,
+                },
+                PerKeyWatermarkBackup {
+                    pkh: "tz4key2".into(),
+                    block: Some(watermark::encode(200_000, 0).to_vec()),
+                    preattestation: None,
+                    attestation: None,
+                },
+            ],
+            source_card_id: None,
+        };
+        assert_eq!(backup.max_watermark_level(), Some(200_000));
+    }
+
+    #[test]
+    fn test_max_watermark_level_no_watermarks() {
+        let backup = SourceBackup {
+            secret_keys_enc: vec![],
+            public_keys: vec![],
+            public_key_hashs: vec![],
+            chain_info: vec![],
+            watermarks: vec![],
+            source_card_id: None,
+        };
+        assert_eq!(backup.max_watermark_level(), None);
     }
 }
