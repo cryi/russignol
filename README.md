@@ -8,7 +8,11 @@
 
 Russignol is a dedicated hardware signing device. Your validator keys stay on isolated hardware.
 
-**Website:** [russignol.com](https://russignol.com)
+**Website:** [russignol.com](https://russignol.com) | **Demo:** [YouTube](https://www.youtube.com/watch?v=FO8th1GVkIg)
+
+<p align="center">
+  <img src="docs/images/russignol-status-display.jpg" alt="Russignol device showing e-ink status display with baker address, block level, and signing activity" width="600">
+</p>
 
 ## Why?
 
