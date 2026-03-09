@@ -8,6 +8,8 @@
 
 Russignol is a dedicated hardware signing device. Your validator keys stay on isolated hardware.
 
+**Website:** [russignol.com](https://russignol.com)
+
 ## Why?
 
 [tz4 addresses](https://octez.tezos.com/docs/active/accounts.html#tz4-bls) (BLS signatures) enable [aggregated attestations](https://research-development.nomadic-labs.com/tallinn-announcement.html)—combining hundreds of signatures into one per block. This reduces consensus data by 63x (from ~900 MB/day to ~14 MB/day), allowing all bakers to attest every block instead of ~200 out of ~300. The result: stronger security through full participation, predictable rewards proportional to stake, and reduced overhead that supports further [block time improvements](https://research-development.nomadic-labs.com/tallinn-announcement.html).
@@ -20,10 +22,12 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 - **USB gadget ethernet only** — WiFi, Bluetooth, Ethernet compiled out of kernel
 - **PIN-protected key storage** — AES-256-GCM encryption, PIN-derived key via Scrypt (256MB memory-hard)
 - **Hardened kernel** — Module signature enforcement, kernel lockdown, locked accounts
-- **High watermark protection** — Refuses to sign at or below previous levels, persists across reboots
-- **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), live signing activity
+- **High watermark protection** — Per-key watermarks for consensus and companion key signing, pre-set one level into the future so signing never blocks on disk I/O, Blake3-hashed for corruption detection, persists across reboots
+- **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), menu-based navigation with Status, Activity, Blockchain, Watermarks, About, and Shutdown pages
+- **Activity LED** — Visual indication of baker connection
+- **CPU frequency scaling** — Idles at 600 MHz, boosts to 1000 MHz during signing and PIN entry
 - **Flash-optimized storage** — F2FS with hardware-adaptive alignment, over-provisioning for wear leveling
-- **Tap-to-shutdown** — 5 rapid taps on the touchscreen triggers a safe shutdown with confirmation
+- **Network mismatch detection** — Warns during key restore if the key's network doesn't match the connected node
 
 ## Hardware Requirements
 
