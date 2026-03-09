@@ -254,6 +254,62 @@ pub fn get_tag_before(reference: &str) -> Result<Option<String>> {
     }
 }
 
+/// Get the most recent stable tag reachable from a reference's parent
+///
+/// Skips pre-release tags (e.g., beta) to find the last stable release.
+/// Optionally filters by component prefix (e.g., "signer-v*").
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
+pub fn get_previous_stable_tag(
+    reference: &str,
+    component_prefix: Option<&str>,
+) -> Result<Option<String>> {
+    let ref_parent = format!("{reference}^");
+    let pattern = if let Some(prefix) = component_prefix {
+        format!("{prefix}-v*")
+    } else {
+        "v*".to_string()
+    };
+
+    let output = Command::new("git")
+        .args([
+            "tag",
+            "-l",
+            &pattern,
+            "--sort=-v:refname",
+            "--merged",
+            &ref_parent,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git tag")?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let prefix_strip = if let Some(prefix) = component_prefix {
+            format!("{prefix}-v")
+        } else {
+            "v".to_string()
+        };
+
+        for tag in stdout.lines() {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(ver) = tag.strip_prefix(&prefix_strip)
+                && pre_release(ver).is_none()
+            {
+                return Ok(Some(tag.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Get the previous tag for a specific component (e.g., "signer-v0.13.3")
 ///
 /// # Errors
@@ -754,17 +810,29 @@ pub fn create_changelog_file_for_component(
     // (e.g., during publish --github retry after a failed release)
     // Determine the commit range: previous_tag..end_ref
     // When current_tag exists, use it as end_ref to avoid including commits after this release
+    // For stable releases, find the previous stable tag to include all beta changes
+    let is_stable = pre_release(version).is_none();
     let (tag, end_ref) = if tag_exists(&current_tag)? {
-        // Current tag exists - find the tag before it and use current tag as end
-        (get_tag_before(&current_tag)?, current_tag.clone())
+        let prev = if is_stable {
+            get_previous_stable_tag(&current_tag, component_prefix)?
+        } else {
+            get_tag_before(&current_tag)?
+        };
+        (prev, current_tag.clone())
     } else if let Some(prefix) = component_prefix {
-        // Current tag doesn't exist yet - use component tag or fall back to release tag
-        (
-            get_previous_component_tag(prefix)?.or(get_previous_tag()?),
-            "HEAD".to_string(),
-        )
+        let prev = if is_stable {
+            get_previous_stable_tag("HEAD", component_prefix)?
+        } else {
+            get_previous_component_tag(prefix)?.or(get_previous_tag()?)
+        };
+        (prev, "HEAD".to_string())
     } else {
-        (get_previous_tag()?, "HEAD".to_string())
+        let prev = if is_stable {
+            get_previous_stable_tag("HEAD", None)?
+        } else {
+            get_previous_tag()?
+        };
+        (prev, "HEAD".to_string())
     };
 
     let commit_lines = get_commits_since(tag.as_deref(), &end_ref, scope_filter)?;
