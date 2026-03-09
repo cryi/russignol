@@ -5,8 +5,9 @@
 //! constitute double-signing (slashable offense in Tenderbake consensus).
 //!
 //! Watermarks are stored as 40-byte binary files (level + round + Blake3)
-//! and fdatasynced to disk before any signature is returned. Each operation
-//! type has a best-effort `.prev` backup for crash recovery.
+//! and fdatasynced to disk before any signature is returned. If a watermark
+//! file is corrupt on load, the signer refuses to operate and requires
+//! manual re-initialization.
 //!
 //! Watermarks are tracked per-key, so each public key hash has independent
 //! watermark state. This supports companion key signing (DAL) where both
@@ -93,8 +94,6 @@ impl OperationType {
 struct PerKeyWatermark {
     /// Primary file handles, indexed by `OperationType as usize`
     files: [File; 3],
-    /// Backup (.prev) file handles, indexed by `OperationType as usize`
-    prev_files: [File; 3],
     /// In-memory cache, indexed by `OperationType as usize`
     entries: [Option<WatermarkEntry>; 3],
     /// What ceiling entry is on stable storage, indexed by `OperationType as usize`.
@@ -216,8 +215,8 @@ pub type Result<T> = std::result::Result<T, WatermarkError>;
 /// named by its base58check encoding (e.g. `tz4HKYQnfQChmDt.../`).
 ///
 /// Watermarks are stored as 40-byte binary files and fdatasynced before
-/// any signature is returned. All file handles (primary and `.prev` backup)
-/// are opened at construction so no path lookups occur at signing time.
+/// any signature is returned. All file handles are opened at construction
+/// so no path lookups occur at signing time.
 ///
 /// Corresponds to: src/bin_signer/handler.ml:27-232
 pub struct HighWatermark {
@@ -408,7 +407,7 @@ impl HighWatermark {
         Ok(())
     }
 
-    /// Persist watermark to disk: `.prev` backup + pwrite + fdatasync.
+    /// Persist watermark to disk: pwrite + fdatasync.
     ///
     /// Only called when no ceiling covers the update (slow path).
     /// When a ceiling covers, the caller skips this entirely — no disk I/O
@@ -420,15 +419,6 @@ impl HighWatermark {
     pub fn write_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
         let per_key = self.per_key_mut(&update.pkh)?;
         let idx = update.idx;
-
-        // Best-effort copy previous value → .prev (no fsync, reaches disk via OS writeback)
-        if let Some(prev) = update.prev {
-            let prev_buf = encode_entry(prev.level, prev.round);
-            let filename = FILENAMES[idx];
-            if let Err(e) = per_key.prev_files[idx].write_all_at(&prev_buf, 0) {
-                log::warn!("Failed to write {filename}.prev: {e}");
-            }
-        }
 
         // Build 40-byte buffer: level (4B BE) + round (4B BE) + blake3 (32B)
         let buf = encode_entry(update.level, update.round);
@@ -657,7 +647,6 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
     fs::create_dir_all(key_dir)?;
 
     let mut files_opt: [Option<File>; 3] = [None, None, None];
-    let mut prev_files_opt: [Option<File>; 3] = [None, None, None];
     let mut entries: [Option<WatermarkEntry>; 3] = [None, None, None];
 
     for (i, filename) in FILENAMES.iter().enumerate() {
@@ -669,25 +658,23 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
             .truncate(false)
             .open(&path)?;
 
-        let prev_path = key_dir.join(format!("{filename}.prev"));
-        let prev_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&prev_path)?;
-
-        // Try primary, then fall back to .prev
-        entries[i] = load_entry_from_file(&file).or_else(|| {
-            let entry = load_entry_from_file(&prev_file);
-            if entry.is_some() {
-                log::warn!("Primary watermark {filename} corrupt/missing, loaded from .prev");
+        // Strict corruption detection: corrupt file is fatal (requires
+        // manual re-initialization to prevent signing with stale watermarks).
+        entries[i] = match load_entry_strict(&file) {
+            Ok(entry) => entry,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Watermark file {filename} in {} is corrupt ({e}). \
+                         Manual re-initialization required.",
+                        key_dir.display()
+                    ),
+                ));
             }
-            entry
-        });
+        };
 
         files_opt[i] = Some(file);
-        prev_files_opt[i] = Some(prev_file);
     }
 
     Ok(PerKeyWatermark {
@@ -695,11 +682,6 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
             files_opt[0].take().unwrap(),
             files_opt[1].take().unwrap(),
             files_opt[2].take().unwrap(),
-        ],
-        prev_files: [
-            prev_files_opt[0].take().unwrap(),
-            prev_files_opt[1].take().unwrap(),
-            prev_files_opt[2].take().unwrap(),
         ],
         disk_entries: entries,
         entries,
@@ -730,16 +712,27 @@ fn load_entry_from_file(file: &File) -> Option<WatermarkEntry> {
     decode_entry(&buf)
 }
 
-/// Load a watermark entry from a file path.
-#[cfg(test)]
-fn load_entry_from_path(path: &Path) -> Option<WatermarkEntry> {
-    let data = fs::read(path).ok()?;
-    if data.len() != WATERMARK_FILE_SIZE {
-        return None;
+/// Load a watermark entry, distinguishing empty files from corrupt ones.
+///
+/// Returns `Ok(None)` for empty files (new key, no watermark yet),
+/// `Ok(Some(entry))` for valid data, or `Err(...)` if the file contains
+/// corrupt data (wrong size or hash mismatch).
+fn load_entry_strict(file: &File) -> io::Result<Option<WatermarkEntry>> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    if len != WATERMARK_FILE_SIZE as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected size: {len} bytes, expected {WATERMARK_FILE_SIZE}"),
+        ));
     }
     let mut buf = [0u8; WATERMARK_FILE_SIZE];
-    buf.copy_from_slice(&data);
+    file.read_exact_at(&mut buf, 0)?;
     decode_entry(&buf)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hash mismatch"))
 }
 
 #[cfg(test)]
@@ -982,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt_primary_falls_back_to_prev() {
+    fn test_corrupt_primary_refuses_to_load() {
         let temp_dir = TempDir::new().unwrap();
         let chain_id = create_test_chain_id();
         let seed = [42u8; 32];
@@ -991,7 +984,7 @@ mod tests {
         preinit_watermarks(temp_dir.path(), &pkh, 99);
         let key_dir = temp_dir.path().join(pkh.to_b58check());
 
-        // Sign at level 100, persist (creates .prev from init data)
+        // Sign at level 100, persist
         {
             let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
             let data = create_block_data(100, 5);
@@ -1002,58 +995,45 @@ mod tests {
             hwm.write_watermark(&update).unwrap();
         }
 
-        // Sign at level 200, persist (copies level 100 to .prev)
-        {
-            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-            let data = create_block_data(200, 3);
-            let update = hwm
-                .check_and_update(chain_id, &pkh, &data)
-                .unwrap()
-                .unwrap();
-            hwm.write_watermark(&update).unwrap();
-        }
-
-        // Corrupt the primary file
+        // Corrupt the primary file (wrong size)
         fs::write(key_dir.join("block_watermark"), b"corrupted!!!").unwrap();
 
-        // Reload — should fall back to .prev (level 100)
-        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-        assert_eq!(
-            hwm.get_entry(&pkh, OperationType::Block),
-            Some(WatermarkEntry {
-                level: 100,
-                round: 5
-            }),
-            "Should load from .prev after primary corruption"
+        // Reload — must refuse to load
+        let Err(err) = HighWatermark::new(temp_dir.path(), &[pkh]) else {
+            panic!("expected error for corrupt watermark file");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("block_watermark"),
+            "error should name the file: {msg}"
+        );
+        assert!(
+            msg.contains("corrupt"),
+            "error should mention corruption: {msg}"
         );
     }
 
     #[test]
-    fn test_both_files_corrupt_returns_none() {
+    fn test_corrupt_primary_hash_mismatch_refuses_to_load() {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-        // Create per-key dir with garbage in both primary and .prev
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
         let key_dir = temp_dir.path().join(pkh.to_b58check());
-        fs::create_dir_all(&key_dir).unwrap();
-        fs::write(key_dir.join("block_watermark"), b"bad_data_xxx").unwrap();
-        fs::write(key_dir.join("block_watermark.prev"), b"bad_data_xxx").unwrap();
 
-        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-        assert_eq!(
-            hwm.get_entry(&pkh, OperationType::Block),
-            None,
-            "Both corrupt files should result in None entry"
-        );
+        // Write 40 bytes with valid size but bad hash
+        let mut bad_buf = encode_entry(500, 0);
+        bad_buf[39] ^= 0xFF; // flip a hash byte
+        fs::write(key_dir.join("block_watermark"), bad_buf).unwrap();
 
-        // Attempting to sign should fail with NotInitialized
-        let chain_id = create_test_chain_id();
-        let data = create_block_data(100, 0);
-
-        let mut hwm = hwm;
-        let result = hwm.check_and_update(chain_id, &pkh, &data);
-        assert!(matches!(result, Err(WatermarkError::NotInitialized { .. })));
+        // Reload — must refuse (hash mismatch, even though size is correct)
+        let Err(err) = HighWatermark::new(temp_dir.path(), &[pkh]) else {
+            panic!("expected error for corrupt watermark file");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("hash mismatch"));
     }
 
     #[test]
@@ -1098,12 +1078,11 @@ mod tests {
         // Write 8 bytes instead of 40
         fs::write(key_dir.join("block_watermark"), [0u8; 8]).unwrap();
 
-        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-        assert_eq!(
-            hwm.get_entry(&pkh, OperationType::Block),
-            None,
-            "Wrong size file should be rejected"
-        );
+        let Err(err) = HighWatermark::new(temp_dir.path(), &[pkh]) else {
+            panic!("expected error for wrong-size watermark file");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unexpected size"));
     }
 
     #[test]
@@ -1140,30 +1119,6 @@ mod tests {
                 })
             );
         }
-    }
-
-    #[test]
-    fn test_prev_file_created_on_write() {
-        let temp_dir = TempDir::new().unwrap();
-        let chain_id = create_test_chain_id();
-        let seed = [42u8; 32];
-        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-
-        preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-
-        let data = create_block_data(100, 0);
-        let update = hwm
-            .check_and_update(chain_id, &pkh, &data)
-            .unwrap()
-            .unwrap();
-        hwm.write_watermark(&update).unwrap();
-
-        // .prev should exist and contain the pre-write data (level 99)
-        let key_dir = temp_dir.path().join(pkh.to_b58check());
-        let prev_entry = load_entry_from_path(&key_dir.join("block_watermark.prev")).unwrap();
-        assert_eq!(prev_entry.level, 99);
-        assert_eq!(prev_entry.round, 0);
     }
 
     #[test]
