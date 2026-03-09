@@ -552,6 +552,13 @@ fn run_restore_flash(
     let backup = restore_keys::read_source_card(restore_source)?;
     spinner.finish_and_clear();
 
+    // Check for network mismatch before target selection
+    if !restore_keys::warn_network_mismatch(&backup, chain_info, yes)? {
+        utils::info("Restore cancelled");
+        println!();
+        return Ok(());
+    }
+
     // Select/validate target device
     let target = if let Some(dev) = device {
         utils::info(&format!("Using specified device: {}", dev.display()));

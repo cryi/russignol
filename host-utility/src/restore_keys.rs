@@ -26,6 +26,7 @@ pub type RestorePartitionLayout = russignol_storage::PartitionLayout;
 /// Derives `ZeroizeOnDrop` so fields are overwritten when the struct is dropped.
 /// Chain info and watermarks are NOT read from the source card — they come from
 /// the Tezos node to ensure correctness even when restoring from old cards.
+/// The source chain ID/name are read only to detect network mismatches.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SourceBackup {
     pub secret_keys_enc: Vec<u8>,
@@ -33,6 +34,10 @@ pub struct SourceBackup {
     pub public_key_hashs: Vec<u8>,
     /// Card ID from flash manifest (None for pre-manifest cards)
     pub source_card_id: Option<String>,
+    /// Chain ID from source card's `chain_info.json` (None for pre-chain-info cards)
+    pub source_chain_id: Option<String>,
+    /// Human-readable chain name from source card (None for pre-chain-info cards)
+    pub source_chain_name: Option<String>,
 }
 
 /// Calculate restore partition layout from sfdisk JSON output.
@@ -235,20 +240,45 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
             fs::read(p3_mount.join("public_keys")).context("Missing public_keys on source card")?;
         let public_key_hashs = fs::read(p3_mount.join("public_key_hashs"))
             .context("Missing public_key_hashs on source card")?;
-        Ok((secret_keys_enc, public_keys, public_key_hashs))
+
+        // Read chain info for network mismatch detection (non-fatal if missing)
+        let (source_chain_id, source_chain_name) =
+            match fs::read_to_string(p3_mount.join("chain_info.json")) {
+                Ok(contents) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&contents).unwrap_or_default();
+                    (
+                        parsed.get("id").and_then(|v| v.as_str()).map(String::from),
+                        parsed
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    )
+                }
+                Err(_) => (None, None),
+            };
+
+        Ok((
+            secret_keys_enc,
+            public_keys,
+            public_key_hashs,
+            source_chain_id,
+            source_chain_name,
+        ))
     })();
 
     // Always unmount p3, even on read error
-    let (secret_keys_enc, public_keys, public_key_hashs) = match p3_result {
-        Ok(data) => {
-            utils::unmount_partition(&p3_mount, &p3_path)?;
-            data
-        }
-        Err(e) => {
-            let _ = utils::unmount_partition(&p3_mount, &p3_path);
-            return Err(e);
-        }
-    };
+    let (secret_keys_enc, public_keys, public_key_hashs, source_chain_id, source_chain_name) =
+        match p3_result {
+            Ok(data) => {
+                utils::unmount_partition(&p3_mount, &p3_path)?;
+                data
+            }
+            Err(e) => {
+                let _ = utils::unmount_partition(&p3_mount, &p3_path);
+                return Err(e);
+            }
+        };
 
     // Read card_id from flash manifest (None for pre-manifest cards)
     let source_card_id = image::read_card_id(source_device);
@@ -258,6 +288,8 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         public_keys,
         public_key_hashs,
         source_card_id,
+        source_chain_id,
+        source_chain_name,
     })
 }
 
@@ -506,6 +538,61 @@ fn is_source_card(device: &Path, backup: &SourceBackup) -> bool {
 /// Returns `true` only when both IDs are `Some` and equal.
 fn card_ids_match(source: Option<&str>, target: Option<&str>) -> bool {
     matches!((source, target), (Some(s), Some(t)) if s == t)
+}
+
+/// Warn the user if the source card's network differs from or cannot be
+/// verified against the node's network.
+///
+/// Returns `Ok(true)` if networks match or the user confirms anyway.
+/// Returns `Ok(false)` if the user declines to proceed.
+/// Defaults to NO for safety — user must explicitly opt in.
+pub fn warn_network_mismatch(
+    backup: &SourceBackup,
+    chain_info: &crate::watermark::ChainInfo,
+    yes: bool,
+) -> Result<bool> {
+    match backup.source_chain_id.as_deref() {
+        Some(source_id) if source_id == chain_info.id => return Ok(true),
+        Some(source_id) => {
+            let source_name = backup.source_chain_name.as_deref().unwrap_or("(unknown)");
+            println!();
+            utils::warning(&format!(
+                "Network mismatch!\n  \
+                 Source card: {} ({})\n  \
+                 Node:        {} ({})\n  \
+                 \n  \
+                 The source card was configured for a different network than the\n  \
+                 connected node. The restored device will use the node's network.\n  \
+                 If this is wrong, re-run with --endpoint pointing to the correct node.",
+                source_name, source_id, chain_info.name, chain_info.id,
+            ));
+        }
+        None => {
+            println!();
+            utils::warning(&format!(
+                "Could not determine the source card's network.\n  \
+                 Node: {} ({})\n  \
+                 \n  \
+                 The source card has no chain info (older firmware). The restored\n  \
+                 device will use the node's network. Make sure your --endpoint\n  \
+                 points to the correct network.",
+                chain_info.name, chain_info.id,
+            ));
+        }
+    }
+    println!();
+
+    if yes {
+        utils::info("Auto-confirmed (--yes)");
+        return Ok(true);
+    }
+
+    let proceed = inquire::Confirm::new("Proceed with restore?")
+        .with_default(false)
+        .with_render_config(utils::create_orange_theme())
+        .prompt()?;
+
+    Ok(proceed)
 }
 
 /// Show a destructive operation warning with key/chain details and require
@@ -869,6 +956,13 @@ pub fn run_single_reader_restore(
         }
     };
 
+    // Check for network mismatch before asking user to swap cards
+    if !warn_network_mismatch(&backup, chain_info, yes)? {
+        utils::info("Restore cancelled");
+        println!();
+        return Ok(());
+    }
+
     // Step 2: Swap to target card — auto-detect via media presence
     utils::info("Remove SOURCE card from the reader, then insert TARGET card");
     wait_for_card_swap(restore_from)?;
@@ -943,6 +1037,14 @@ pub fn run_dual_reader_restore(
 mod tests {
     use super::*;
 
+    /// Returns `true` when the source card has a chain ID that differs from the node's.
+    ///
+    /// Returns `false` when source has no chain ID (pre-chain-info card, skip check)
+    /// or when the IDs match.
+    fn chain_ids_mismatch(source_chain_id: Option<&str>, node_chain_id: &str) -> bool {
+        matches!(source_chain_id, Some(id) if id != node_chain_id)
+    }
+
     #[test]
     fn test_source_backup_zeroize() {
         let mut backup = SourceBackup {
@@ -950,6 +1052,8 @@ mod tests {
             public_keys: vec![5, 6, 7],
             public_key_hashs: vec![8, 9],
             source_card_id: Some("a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".into()),
+            source_chain_id: Some("NetXdQprcVkpaWU".into()),
+            source_chain_name: Some("TEZOS_MAINNET".into()),
         };
 
         backup.zeroize();
@@ -958,6 +1062,8 @@ mod tests {
         assert!(backup.public_keys.is_empty());
         assert!(backup.public_key_hashs.is_empty());
         assert_eq!(backup.source_card_id, None);
+        assert_eq!(backup.source_chain_id, None);
+        assert_eq!(backup.source_chain_name, None);
     }
 
     #[test]
@@ -983,6 +1089,27 @@ mod tests {
     #[test]
     fn test_card_ids_match_both_none() {
         assert!(!card_ids_match(None, None));
+    }
+
+    #[test]
+    fn test_chain_ids_mismatch_different() {
+        assert!(chain_ids_mismatch(
+            Some("NetXdQprcVkpaWU"),
+            "NetXnHfVqm9iesp"
+        ));
+    }
+
+    #[test]
+    fn test_chain_ids_mismatch_same() {
+        assert!(!chain_ids_mismatch(
+            Some("NetXdQprcVkpaWU"),
+            "NetXdQprcVkpaWU"
+        ));
+    }
+
+    #[test]
+    fn test_chain_ids_mismatch_source_none() {
+        assert!(!chain_ids_mismatch(None, "NetXdQprcVkpaWU"));
     }
 
     #[test]
