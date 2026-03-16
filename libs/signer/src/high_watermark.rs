@@ -224,6 +224,9 @@ pub struct HighWatermark {
     /// Set of PKHs this tracker is authorised to manage (fixed at construction).
     known_pkhs: HashSet<PublicKeyHash>,
     keys: HashMap<PublicKeyHash, PerKeyWatermark>,
+    /// Injected I/O error for testing write failure paths
+    #[cfg(test)]
+    pub force_write_error: bool,
 }
 
 impl HighWatermark {
@@ -252,6 +255,8 @@ impl HighWatermark {
             base_dir,
             known_pkhs,
             keys,
+            #[cfg(test)]
+            force_write_error: false,
         })
     }
 
@@ -417,6 +422,13 @@ impl HighWatermark {
     ///
     /// Returns an error if the key is not initialized or disk I/O fails.
     pub fn write_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
+        #[cfg(test)]
+        if self.force_write_error {
+            return Err(WatermarkError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected write error for testing",
+            )));
+        }
         let per_key = self.per_key_mut(&update.pkh)?;
         let idx = update.idx;
 
@@ -1519,6 +1531,71 @@ mod tests {
                 level: 102,
                 round: 0
             })
+        );
+    }
+
+    #[test]
+    fn test_write_failure_prevents_advance_and_allows_rollback() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Advance in-memory to level 100
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+
+        // Inject write failure
+        hwm.force_write_error = true;
+        let write_result = hwm.write_watermark(&update);
+        assert!(
+            write_result.is_err(),
+            "Write should fail with injected error"
+        );
+
+        // Roll back in-memory state
+        hwm.rollback_update(&update);
+
+        // Verify in-memory state is restored to level 99
+        assert_eq!(
+            hwm.get_entry(&pkh, OperationType::Block),
+            Some(WatermarkEntry {
+                level: 99,
+                round: 0
+            }),
+            "In-memory watermark should be rolled back to pre-update state"
+        );
+
+        // Verify disk still has level 99
+        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        assert_eq!(
+            hwm2.get_entry(&pkh, OperationType::Block),
+            Some(WatermarkEntry {
+                level: 99,
+                round: 0
+            }),
+            "Disk watermark should remain at original level after write failure"
+        );
+
+        // Disable injection and verify retry succeeds
+        hwm.force_write_error = false;
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update2).unwrap();
+        assert_eq!(
+            hwm.get_entry(&pkh, OperationType::Block),
+            Some(WatermarkEntry {
+                level: 100,
+                round: 0
+            }),
         );
     }
 

@@ -245,6 +245,17 @@ enum Commands {
         publish: PublishTargets,
     },
 
+    /// Generate code coverage report
+    Coverage {
+        /// Open HTML report in browser
+        #[arg(long)]
+        open: bool,
+
+        /// Generate LCOV output instead of HTML
+        #[arg(long)]
+        lcov: bool,
+    },
+
     /// Build, deploy, and restart signer on connected device
     Deploy {
         /// Skip build step (deploy previously built binary)
@@ -403,6 +414,7 @@ fn try_main() -> Result<()> {
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
+        Commands::Coverage { open, lcov } => cmd_coverage(open, lcov),
         Commands::Deploy { skip_build } => deploy::deploy(skip_build),
         Commands::WatermarkTest {
             device,
@@ -1350,6 +1362,51 @@ fn cmd_test(fuzz: bool) -> Result<()> {
             "Proptest fuzzing failed",
         )?;
         println!("{}", "✓ Proptest fuzzing complete".green());
+    }
+
+    // Check for unused dependencies with cargo-machete
+    println!("\n{}", "Checking for unused dependencies...".cyan());
+    if which::which("cargo-machete").is_ok() {
+        run_cmd("cargo", &["machete"], "Unused dependencies found")?;
+        println!("{}", "✓ No unused dependencies".green());
+    } else {
+        println!(
+            "  {} cargo-machete not installed, skipping. Install with: {}",
+            "⚠".yellow(),
+            "cargo install cargo-machete".cyan()
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_coverage(open: bool, lcov: bool) -> Result<()> {
+    check_command(
+        "cargo-llvm-cov",
+        "Install with: cargo install cargo-llvm-cov",
+    )?;
+
+    println!("{}", "Generating code coverage report...".cyan());
+
+    let mut args = vec!["llvm-cov", "--workspace"];
+    if lcov {
+        args.extend_from_slice(&["--lcov", "--output-path", "target/coverage/lcov.info"]);
+    } else {
+        args.extend_from_slice(&["--html", "--output-dir", "target/coverage/html"]);
+    }
+    if open {
+        args.push("--open");
+    }
+
+    run_cargo(&args, "Coverage generation failed")?;
+
+    if lcov {
+        println!("{} target/coverage/lcov.info", "✓ LCOV report:".green());
+    } else {
+        println!(
+            "{} target/coverage/html/index.html",
+            "✓ HTML report:".green()
+        );
     }
 
     Ok(())

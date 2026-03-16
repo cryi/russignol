@@ -147,12 +147,49 @@ fn test_recommended_fix_pattern() {
 }
 
 // ============================================================================
-// Note on HighWatermark implementation
+// RequestHandler integration test with poisoned lock
 // ============================================================================
 
-// The tests above demonstrate the lock poisoning behavior with `.unwrap()`.
-//
-// The HighWatermark is wrapped in `RwLock<HighWatermark>` by the server. If a
-// thread panics while holding the lock, the caller should use
-// `.unwrap_or_else(PoisonError::into_inner)` to recover the data. The server's
-// UpdateWatermarkToLevel handler demonstrates this pattern.
+/// Test that RequestHandler returns Error::Internal (not a panic) when the
+/// KeyManager lock is poisoned.
+///
+/// This exercises the real server code path, unlike the unit tests above
+/// that only test raw RwLock recovery patterns.
+#[test]
+fn test_request_handler_returns_error_on_poisoned_lock() {
+    use russignol_signer_lib::SignerRequest;
+    use russignol_signer_lib::bls::generate_key;
+    use russignol_signer_lib::server::{Error, KeyManager, RequestHandler};
+
+    let seed = [42u8; 32];
+    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+    let signer = russignol_signer_lib::signer::Unencrypted::generate(Some(&seed)).unwrap();
+
+    let mut mgr = KeyManager::new();
+    mgr.add_signer(pkh, signer, "test_key".to_string());
+
+    let keys = Arc::new(RwLock::new(mgr));
+    let handler = RequestHandler::new(
+        Arc::clone(&keys),
+        None, // no watermark
+        None, // no magic byte filter
+        true, // allow_list_known_keys
+        true, // allow_prove_possession
+    );
+
+    // Poison the lock by panicking while holding a write guard
+    let keys_clone = Arc::clone(&keys);
+    let handle = thread::spawn(move || {
+        let _guard = keys_clone.write().unwrap();
+        panic!("intentional panic to poison lock");
+    });
+    let _ = handle.join();
+
+    // PublicKey request should return Error::Internal, not panic
+    let result = handler.handle_request(SignerRequest::PublicKey { pkh });
+    assert!(result.is_err(), "Should return error, not panic");
+    assert!(
+        matches!(result.unwrap_err(), Error::Internal(_)),
+        "Should be Error::Internal for poisoned lock"
+    );
+}

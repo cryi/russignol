@@ -1460,6 +1460,67 @@ mod tests {
     }
 
     #[test]
+    fn test_watermark_write_failure_prevents_signature_return() {
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let hwm = Arc::new(RwLock::new(
+            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+        ));
+
+        // Inject write error
+        hwm.write().unwrap().force_write_error = true;
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        );
+
+        // Create block data at level 100
+        let data = crate::test_utils::create_block_data(100, 0);
+
+        // Sign request should fail (watermark write fails → no signature returned)
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (pkh, 0),
+            data,
+            signature: None,
+        });
+
+        assert!(
+            result.is_err(),
+            "Should refuse to return signature when watermark write fails"
+        );
+        assert!(
+            matches!(result.unwrap_err(), Error::Watermark(_)),
+            "Error should be a watermark error"
+        );
+
+        // Verify watermark was rolled back in-memory (baker can retry)
+        let wm = hwm.read().unwrap();
+        assert_eq!(
+            wm.get_current_level(
+                ChainId::from_bytes(&{
+                    let mut b = [0u8; 32];
+                    b[..4].copy_from_slice(&[0, 0, 0, 1]);
+                    b
+                }),
+                &pkh
+            ),
+            Some(99),
+            "In-memory watermark should be rolled back after write failure"
+        );
+    }
+
+    #[test]
     fn test_zero_blocks_per_cycle_does_not_panic() {
         // Test that blocks_per_cycle = 0 doesn't cause division by zero
         // The gap detection should be skipped when blocks_per_cycle is 0

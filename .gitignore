@@ -11,6 +11,9 @@
 # Buildroot state tracking (xtask-generated)
 /rpi-signer/buildroot-external/.last_build_config
 
+# Coverage reports
+target/coverage/
+
 # AI assistants (user-specific)
 .claude/
 

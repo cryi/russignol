@@ -165,6 +165,9 @@ impl SecretKey {
             Err(blst::BLST_ERROR::BLST_BAD_ENCODING) => {
                 // Key is out of range - reduce it modulo the curve order
                 // This matches OCaml's behavior which accepts out-of-range keys
+                log::warn!(
+                    "BLS secret key out of range (>= curve order r), applying modular reduction for OCaml compatibility"
+                );
 
                 // BLS12-381 scalar field order (r)
                 // This is the order of the scalar field for BLS12-381
